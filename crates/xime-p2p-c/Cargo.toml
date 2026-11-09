@@ -1,0 +1,16 @@
+[package]
+name = "xime-p2p-c"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "xime-p2p 的 C ABI 薄层（供鸿蒙 NAPI 等非 Rust 宿主调用）"
+repository = "https://github.com/ximeiorg/libximep2p"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+xime-p2p = { path = "../xime-p2p" }
+xime-sync-domain = { path = "../xime-sync-domain" }

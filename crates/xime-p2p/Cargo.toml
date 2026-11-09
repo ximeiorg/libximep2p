@@ -1,0 +1,46 @@
+[package]
+name = "xime-p2p"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Xime 跨设备剪贴板 P2P 传输层（局域网直连，无第三方服务器）"
+repository = "https://github.com/ximeiorg/libximep2p"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "signal",
+    "sync",
+    "time",
+    "fs",
+    "rt",
+    "io-util",
+] }
+base64 = "0.23.1"
+hex = "0.4"
+subtle = "2"
+getrandom = "0.4.3"
+sha2 = "0.11.1"
+hmac = "0.13"
+xime-sync-domain = { path = "../xime-sync-domain" }
+
+# ---- 密码学 ----
+# digest 0.11 / aead 0.11 一代，四个版本必须同代：
+# sha2 0.11 + hmac 0.13 + hkdf 0.13 + chacha20poly1305 0.11
+hkdf = "0.13"
+chacha20poly1305 = "0.11"
+ed25519-dalek = "3"
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+snow = "0.10"
+# spake2 最新稳定版仍是 0.4（0.5 只有 pre-release）。
+spake2 = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "time"] }
+tempfile = "3"

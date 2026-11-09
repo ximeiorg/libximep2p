@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "_comment": "配对 KDF 与会话 prologue 的确定值。这两处决定两端能否派生出同一把密钥，必须逐字节一致。",
+  "pairing_kdf": {
+    "shared_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "nonce_a_hex": "000102030405060708090a0b0c0d0e0f",
+    "nonce_b_hex": "101112131415161718191a1b1c1d1e1f",
+    "prk_hex": "e8499be4f1980d68f13222a418df5cbd97d53fddf590c2108e22d40005b70713",
+    "k_c2s_hex": "f1844f73eccafdc6ea6096c00a430a3861396c314fddb1e2f0705ef11d7d6e11",
+    "k_s2c_hex": "c52fb4193e82995b7603e6527e247083b512cbe4ec530421a2b204a8a89e54d8",
+    "k_id_hex": "7611347d495bb3e2c9e4d540d369e8a81b561680b7d8de7953b82e6d4f95e10a",
+    "confirm_c2s_hex": "8890a9399af2dbb77ab10c4daac3cd852a7778e9e091b06a581ddae3b0c09a7e",
+    "confirm_s2c_hex": "e2168a7cd7de0b802ef325baff4e674591b193784eb2bc0937f172ef777dae19"
+  },
+  "prologue": {
+    "tag": "xime-p2p/session/v1",
+    "did_lo_hex": "000102030405060708090a0b0c0d0e0f",
+    "did_hi_hex": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+    "expect_hex": "78696d652d7032702f73657373696f6e2f7631000102030405060708090a0b0c0d0e0fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
+  }
+}

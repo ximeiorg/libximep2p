@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "_comment": "跨语言测试向量：Kotlin / Rust 两侧单测必须读取同一份文件并逐字节比对。改动协议时先改这里，两侧同时变红才算安全。",
+  "frames": [
+    {
+      "name": "ping",
+      "type": 10,
+      "flags": 0,
+      "payload_hex": "7b7d",
+      "frame_hex": "5850010a00000000027b7d"
+    },
+    {
+      "name": "error_code_2",
+      "type": 12,
+      "flags": 0,
+      "payload_hex": "7b22636f6465223a327d",
+      "frame_hex": "5850010c000000000a7b22636f6465223a327d"
+    },
+    {
+      "name": "empty_payload",
+      "type": 11,
+      "flags": 0,
+      "payload_hex": "",
+      "frame_hex": "5850010b0000000000"
+    },
+    {
+      "name": "encrypted_flag_set",
+      "type": 8,
+      "flags": 1,
+      "payload_hex": "aabbcc",
+      "frame_hex": "585001080100000003aabbcc"
+    }
+  ],
+  "reject": [
+    {
+      "name": "payload_too_large",
+      "header_hex": "5850010a0000100001",
+      "reason": "length 超过 1 MiB 上限（1048577）"
+    },
+    {
+      "name": "bad_magic",
+      "header_hex": "5859010a0000000002",
+      "reason": "魔数不是 58 50"
+    },
+    {
+      "name": "bad_version",
+      "header_hex": "5850020a0000000002",
+      "reason": "版本不是 01"
+    },
+    {
+      "name": "unknown_type",
+      "header_hex": "585001ff0000000000",
+      "reason": "未知消息类型 0xFF"
+    }
+  ]
+}

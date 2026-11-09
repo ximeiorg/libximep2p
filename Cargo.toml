@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/xime-sync-domain",
+    "crates/xime-p2p",
+    "crates/xime-p2p-c",
+]
