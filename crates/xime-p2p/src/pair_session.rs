@@ -16,7 +16,9 @@ use crate::error::Error;
 use crate::identity::{Identity, PublicIdentity};
 use crate::proto::{pair_as_display, pair_as_input};
 use crate::store::{PairedPeer, PeerStore};
-use crate::transport::{AnnKind, Announce, Broadcaster, Listener, PAIR_PORT, Watcher, connect};
+use crate::transport::{
+    AnnKind, Announce, Broadcaster, Listener, PAIR_PORT, UDP_PORT, Watcher, connect,
+};
 
 /// 加载或生成长期身份，落盘到 `dir/identity.bin`。
 ///
@@ -229,7 +231,7 @@ pub fn join(
     rt.block_on(async move {
         let watcher = Watcher::bind()
             .await
-            .map_err(|e| Error::Internal(format!("发现端口 {PAIR_PORT} 不可用：{e}")))?;
+            .map_err(|e| Error::Internal(format!("发现端口 {UDP_PORT} 不可用：{e}")))?;
         let deadline = Instant::now() + timeout;
         // 公告是全频道共享的：同一网段里常驻的同步节点也在广播，它们同样会把
         // 自己的同步端口报上来。所以「连上一台设备」不等于「连上了出码端」，
@@ -249,8 +251,7 @@ pub fn join(
                     "未发现在线设备".into()
                 }));
             }
-            let Ok(Some((ann, from))) = watcher.recv(left.min(Duration::from_secs(1))).await
-            else {
+            let Ok(Some((ann, from))) = watcher.recv(left.min(Duration::from_secs(1))).await else {
                 continue;
             };
             // 新版对端会声明角色，常驻同步节点直接跳过，省掉一次必然失败的连接。

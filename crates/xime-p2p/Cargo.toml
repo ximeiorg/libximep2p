@@ -41,6 +41,10 @@ snow = "0.10"
 # spake2 最新稳定版仍是 0.4（0.5 只有 pre-release）。
 spake2 = "0.4"
 
+# 公告端口要在输入法 daemon 与设置程序之间用 SO_REUSEADDR 共享
+# （tokio 未暴露该选项，先用 socket2 建 socket 再转换）。
+socket2 = "0.6"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "time"] }
 tempfile = "3"

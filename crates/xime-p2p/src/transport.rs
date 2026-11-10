@@ -8,6 +8,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use crate::error::Error;
@@ -219,11 +220,16 @@ pub struct Watcher {
 impl Watcher {
     /// 绑定公告端口。
     ///
-    /// 多实例（如输入法与设置应用同时运行）会撞端口。这里用 `SO_REUSEADDR` 语义的
-    /// 做法受限于 tokio 未暴露该选项，因此失败时返回错误，由上层决定是否降级为
-    /// 「只发不收」——发现是尽力而为，不因为它失败就阻断已配对设备的重连。
+    /// 多实例（如输入法与设置应用同时运行）会撞端口：输入法的常驻节点在
+    /// 47822 上收公告，设置程序的「输入配对码」也要在同一端口收公告。两者
+    /// 都必须能收到广播，因此用 `SO_REUSEADDR` 共享端口——Linux 上广播包
+    /// 会投递给所有绑定该端口的 socket。tokio 未暴露该选项，先用 socket2
+    /// 建好再转成 tokio socket。
+    ///
+    /// 兼容性：窗口内只有一端设置了 `SO_REUSEADDR` 时仍然绑不上，因此
+    /// 升级后需要两端都重启（设置程序与 daemon 都来自同一份库）。
     pub async fn bind() -> Result<Self, Error> {
-        let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, UDP_PORT)).await?;
+        let sock = bind_reuse(UDP_PORT)?;
         Ok(Self { sock })
     }
 
@@ -249,6 +255,21 @@ impl Watcher {
             // 不是我们的包，继续等（不消耗调用方的超时预算之外的时间）。
         }
     }
+}
+
+/// 用 `SO_REUSEADDR` 绑定 UDP 端口，再转成 tokio socket。
+///
+/// Windows 的 `SO_REUSEADDR` 语义是「允许抢占」，会带来安全问题，只在
+/// Unix 打开；那边的多实例冲突留给平台适配层处理。
+fn bind_reuse(port: u16) -> Result<UdpSocket, Error> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
+    socket.set_broadcast(true)?;
+    socket.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())?;
+    socket.set_nonblocking(true)?;
+    let std_sock: std::net::UdpSocket = socket.into();
+    Ok(UdpSocket::from_std(std_sock)?)
 }
 
 #[cfg(test)]
@@ -289,7 +310,8 @@ mod tests {
     /// 角色字段可省：旧版公告解码成 Unknown，新版对端仍会「连上再试」。
     #[test]
     fn 公告角色缺省为未知() {
-        let legacy = br#"{"s":"xime-clip","v":1,"did":"0123456789abcdef0123456789abcdef","pt":47821}"#;
+        let legacy =
+            br#"{"s":"xime-clip","v":1,"did":"0123456789abcdef0123456789abcdef","pt":47821}"#;
         let ann = Announce::decode(legacy).unwrap();
         assert_eq!(ann.k, AnnKind::Unknown);
 
@@ -354,5 +376,19 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+    }
+
+    /// 输入法 daemon 与设置程序会同时监听公告端口：SO_REUSEADDR 下应能共存。
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn 公告端口可被多实例共享() {
+        // 用临时端口，避免依赖本机是否正跑着 daemon。
+        let probe = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let first = bind_reuse(port).expect("首实例绑定");
+        let second = bind_reuse(port).expect("第二实例应能复用端口");
+        drop(first);
+        drop(second);
     }
 }
