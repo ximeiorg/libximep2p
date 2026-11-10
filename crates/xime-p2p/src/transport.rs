@@ -33,6 +33,32 @@ const MAX_ANNOUNCE_BYTES: usize = 512;
 
 // ─────────────────────────── 公告 ───────────────────────────
 
+/// 公告声明的角色：这个端口上是常驻同步节点，还是正在显示配对码的会话。
+///
+/// 加这个字段的理由：两种角色共用同一个 UDP 广播频道，且同一台设备可能两者同时在跑。
+/// 只报端口时，接收方无法判断「连上去会不会讲配对协议」，只能连一次试——试错会
+/// 让多设备环境下的配对变慢，也让配对的错误信息失真。
+///
+/// 兼容性：字段可省。旧版对端不发它（解码成 [`AnnKind::Unknown`]），新版对端收到
+/// 旧公告时照旧「连上再试」，因此混跑新旧版本不会失效。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnnKind {
+    /// 常驻同步节点，端口讲 Noise 会话。
+    Node,
+    /// 配对会话，端口讲配对协议。
+    Pair,
+    /// 旧版公告没有该字段。
+    #[default]
+    Unknown,
+}
+
+impl AnnKind {
+    fn is_unknown(&self) -> bool {
+        *self == AnnKind::Unknown
+    }
+}
+
 /// 局域网公告（§5.2）。
 ///
 /// 注意：**不含任何配对码或密钥**。同网段任何人可见，因此只能放公开信息。
@@ -46,15 +72,19 @@ pub struct Announce {
     pub did: String,
     /// 实际 TCP 端口（可能因占用而顺延，不能假定等于 [`TCP_PORT`]）。
     pub pt: u16,
+    /// 端口角色；旧版公告没有该字段。
+    #[serde(default, skip_serializing_if = "AnnKind::is_unknown")]
+    pub k: AnnKind,
 }
 
 impl Announce {
-    pub fn new(did: impl Into<String>, tcp_port: u16) -> Self {
+    pub fn new(did: impl Into<String>, tcp_port: u16, kind: AnnKind) -> Self {
         Self {
             s: ANNOUNCE_MAGIC.to_string(),
             v: ANNOUNCE_VERSION,
             did: did.into(),
             pt: tcp_port,
+            k: kind,
         }
     }
 
@@ -227,7 +257,7 @@ mod tests {
 
     #[test]
     fn 公告编解码往返() {
-        let ann = Announce::new("0123456789abcdef0123456789abcdef", TCP_PORT);
+        let ann = Announce::new("0123456789abcdef0123456789abcdef", TCP_PORT, AnnKind::Node);
         let bytes = ann.encode().unwrap();
         let back = Announce::decode(&bytes).unwrap();
         assert_eq!(ann, back);
@@ -236,29 +266,46 @@ mod tests {
     #[test]
     fn 拒绝非法公告() {
         // 标识不对
-        let mut ann = Announce::new("0123456789abcdef0123456789abcdef", TCP_PORT);
+        let mut ann = Announce::new("0123456789abcdef0123456789abcdef", TCP_PORT, AnnKind::Node);
         ann.s = "other".into();
         assert!(Announce::decode(&serde_json::to_vec(&ann).unwrap()).is_none());
 
         // 版本不对
-        let mut ann = Announce::new("0123456789abcdef0123456789abcdef", TCP_PORT);
+        let mut ann = Announce::new("0123456789abcdef0123456789abcdef", TCP_PORT, AnnKind::Node);
         ann.v = 9;
         assert!(Announce::decode(&serde_json::to_vec(&ann).unwrap()).is_none());
 
         // did 长度不对
-        let mut ann = Announce::new("0123456789abcdef0123456789abcdef", TCP_PORT);
+        let mut ann = Announce::new("0123456789abcdef0123456789abcdef", TCP_PORT, AnnKind::Node);
         ann.did = "abc".into();
         assert!(Announce::decode(&serde_json::to_vec(&ann).unwrap()).is_none());
 
         // 非 hex
-        let mut ann = Announce::new("0123456789abcdef0123456789abcdef", TCP_PORT);
+        let mut ann = Announce::new("0123456789abcdef0123456789abcdef", TCP_PORT, AnnKind::Node);
         ann.did = "zzzz456789abcdef0123456789abcdef".into();
         assert!(Announce::decode(&serde_json::to_vec(&ann).unwrap()).is_none());
     }
 
+    /// 角色字段可省：旧版公告解码成 Unknown，新版对端仍会「连上再试」。
+    #[test]
+    fn 公告角色缺省为未知() {
+        let legacy = br#"{"s":"xime-clip","v":1,"did":"0123456789abcdef0123456789abcdef","pt":47821}"#;
+        let ann = Announce::decode(legacy).unwrap();
+        assert_eq!(ann.k, AnnKind::Unknown);
+
+        let pair = Announce::new("0123456789abcdef0123456789abcdef", 47823, AnnKind::Pair);
+        let back = Announce::decode(&pair.encode().unwrap()).unwrap();
+        assert_eq!(back.k, AnnKind::Pair);
+
+        // 未知角色不写入报文，保持与旧版的字节兼容。
+        let unknown = Announce::new("0123456789abcdef0123456789abcdef", 47821, AnnKind::Unknown);
+        let json = String::from_utf8(unknown.encode().unwrap()).unwrap();
+        assert!(!json.contains("\"k\""), "未知角色不应出现在报文里：{json}");
+    }
+
     #[test]
     fn 拒绝超长公告() {
-        let ann = Announce::new("0".repeat(32), TCP_PORT);
+        let ann = Announce::new("0".repeat(32), TCP_PORT, AnnKind::Node);
         let mut bytes = serde_json::to_vec(&ann).unwrap();
         bytes.resize(MAX_ANNOUNCE_BYTES + 1, b' ');
         assert!(Announce::decode(&bytes).is_none());

@@ -6,6 +6,7 @@
 //!
 //! 路径策略（身份存哪、配对表存哪）不在这里决定，由宿主传入，四端各自适配。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,7 +16,7 @@ use crate::error::Error;
 use crate::identity::{Identity, PublicIdentity};
 use crate::proto::{pair_as_display, pair_as_input};
 use crate::store::{PairedPeer, PeerStore};
-use crate::transport::{Announce, Broadcaster, Listener, PAIR_PORT, Watcher, connect};
+use crate::transport::{AnnKind, Announce, Broadcaster, Listener, PAIR_PORT, Watcher, connect};
 
 /// 加载或生成长期身份，落盘到 `dir/identity.bin`。
 ///
@@ -169,7 +170,11 @@ impl DisplaySession {
         let stop = Arc::clone(&self.stop);
         // 端口可能因占用顺延，公告必须写真实端口；写死 PAIR_PORT 会让
         // 输入端连到一个没人监听的端口，表现为「一直找不到设备」。
-        let ann = Announce::new(identity.did().to_hex(), self.listener.local_port()?);
+        let ann = Announce::new(
+            identity.did().to_hex(),
+            self.listener.local_port()?,
+            AnnKind::Pair,
+        );
 
         self.rt.block_on(async move {
             let deadline = Instant::now() + timeout;
@@ -226,16 +231,44 @@ pub fn join(
             .await
             .map_err(|e| Error::Internal(format!("发现端口 {PAIR_PORT} 不可用：{e}")))?;
         let deadline = Instant::now() + timeout;
+        // 公告是全频道共享的：同一网段里常驻的同步节点也在广播，它们同样会把
+        // 自己的同步端口报上来。所以「连上一台设备」不等于「连上了出码端」，
+        // 连错时必须继续找下一台，否则多设备环境下配对会直接失败。
+        //
+        // 冷却按 (did, 端口) 记：同一台设备可能既在跑同步节点又在显示配对码，
+        // 只按 did 冷却会把它的配对端口一起屏蔽掉。
+        let mut attempted: HashMap<(String, u16), Instant> = HashMap::new();
+        let mut saw_other_device = false;
 
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Err(Error::Internal("未发现在线设备".into()));
+                return Err(Error::Internal(if saw_other_device {
+                    "没有设备在显示配对码，请在对方设备上打开配对界面".into()
+                } else {
+                    "未发现在线设备".into()
+                }));
             }
             let Ok(Some((ann, from))) = watcher.recv(left.min(Duration::from_secs(1))).await
             else {
                 continue;
             };
+            // 新版对端会声明角色，常驻同步节点直接跳过，省掉一次必然失败的连接。
+            // 旧版公告没有角色字段（Unknown），仍按「连上再试」处理。
+            if ann.k == AnnKind::Node {
+                continue;
+            }
+
+            // 同一台设备的公告每秒重发一次；刚试过的先放一放，免得它把
+            // 时间片全占掉（真正的出码端可能后到）。
+            let target = (ann.did.clone(), ann.pt);
+            if attempted
+                .get(&target)
+                .is_some_and(|at| at.elapsed() < RETRY_COOLDOWN)
+            {
+                continue;
+            }
+            attempted.insert(target, Instant::now());
 
             // 端口取公告里的实际值：对端配对端口可能已被别的进程占走而顺延，
             // 用常量 PAIR_PORT 会连到空端口上。
@@ -248,12 +281,33 @@ pub fn join(
                     save_peer(&store_path, &public)?;
                     return Ok(public);
                 }
-                // 码错了就直接失败：对同一台设备反复试同一个错码没有意义，
-                // 而且会白白消耗协议里的尝试次数。
-                Err(e) => return Err(e),
+                // 对端答复了配对协议（码错 / 被占用 / 版本不符）：换一台也救不回来，
+                // 而且对同一台设备反复试同一个错码只会白白消耗协议里的尝试次数。
+                Err(e) if answered_pairing(&e) => return Err(e),
+                // 其余情况说明连上的不是出码端（多半是常驻同步节点），继续找。
+                Err(_) => saw_other_device = true,
             }
         }
     })
+}
+
+/// 同一台设备两次尝试之间的最小间隔（公告周期是 1 秒）。
+const RETRY_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// 该错误是否来自「对端确实在跑配对流程」。
+///
+/// 判据是这些错误只可能在对方解析并响应了配对帧之后产生；反之
+/// [`Error::Closed`] / [`Error::Io`] / [`Error::NotPaired`] 意味着连上的是同步节点
+/// 或对端在握手前就消失了——那台设备不该终结整次配对。
+fn answered_pairing(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::AuthFailed
+            | Error::CodeExpired
+            | Error::TooManyAttempts
+            | Error::Busy
+            | Error::VersionMismatch { .. }
+    )
 }
 
 /// 输入端：已知地址时直接连（二维码带 IP、或用户手工输入 IP）。
@@ -312,6 +366,69 @@ mod tests {
         load_or_create_identity(dir.path()).unwrap();
         let meta = std::fs::metadata(dir.path().join("identity.bin")).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    /// 只有「对端真的回答过配对帧」的错误才该终结整次配对；连错了设备
+    /// （常驻同步节点、对端提前断开）必须继续找下一台。
+    #[test]
+    fn 错误分类决定是否继续找下一台() {
+        assert!(answered_pairing(&Error::AuthFailed));
+        assert!(answered_pairing(&Error::CodeExpired));
+        assert!(answered_pairing(&Error::TooManyAttempts));
+        assert!(answered_pairing(&Error::Busy));
+        assert!(answered_pairing(&Error::VersionMismatch {
+            got: 2,
+            expected: 1
+        }));
+
+        assert!(!answered_pairing(&Error::Closed));
+        assert!(!answered_pairing(&Error::NotPaired));
+        assert!(!answered_pairing(&Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset"
+        ))));
+    }
+
+    /// 连错设备（常驻同步节点）时必须还能继续找下一台。
+    ///
+    /// 用一个「接受连接后立刻断开」的对端模拟同步节点：它收到配对帧就丢弃连接，
+    /// 输入端读到的只能是 EOF。这个错误绝不能终结整次配对，否则局域网里只要有
+    /// 一台设备在跑同步节点，配对就必失败。
+    #[test]
+    fn 连到同步节点时仍可继续找下一台() {
+        use std::io::Read;
+
+        let dir = temp_dir();
+        let identity = load_or_create_identity(dir.path()).unwrap();
+        let code = PairingCode::from_digits(482_719).unwrap();
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let node = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                // 读掉首个字节就断开，模拟节点对配对帧不做响应。
+                let _ = sock.read(&mut [0u8; 1]);
+            }
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(async {
+                let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .unwrap();
+                pair_as_input(&mut stream, &identity, "Phone", &code).await
+            })
+            .expect_err("对端提前断开时不应配对成功");
+
+        assert!(
+            !answered_pairing(&err),
+            "连到同步节点不该终结整次配对：{err:?}"
+        );
+        let _ = node.join();
     }
 
     #[test]

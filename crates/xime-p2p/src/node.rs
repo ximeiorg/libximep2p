@@ -27,7 +27,7 @@ use crate::frame::{Frame, MsgType};
 use crate::identity::Identity;
 use crate::proto::{Connection, session_accept, session_initiate};
 use crate::store::{PairedPeer, PeerStore};
-use crate::transport::{Announce, Broadcaster, Listener, TCP_PORT, Watcher, connect};
+use crate::transport::{AnnKind, Announce, Broadcaster, Listener, TCP_PORT, Watcher, connect};
 
 /// 广播间隔。局域网内设备少，3 秒足够让对端在可感知的时间内发现。
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(3);
@@ -166,8 +166,8 @@ impl Node {
     /// 投递一条本地剪贴板变更。
     ///
     /// 返回 `true` 表示指令已入队；`false` 表示节点已关闭。
-    /// **无连接时不会报错**——剪贴板只关心最新值，对端连上后的推送由调用方
-    /// 下一次 `set_clipboard` 自然带出，不需要在这里排队回溯。
+    /// **无连接时不会报错**：节点会记住最近一条，等连接建立后补发一次
+    /// （剪贴板只关心最新值，不需要排队回溯历史变更）。
     /// 本方法不阻塞，可以在同步循环里直接调。
     pub fn set_clipboard(&self, profile: Profile) -> bool {
         self.cmd_tx.send(Cmd::Clipboard(profile)).is_ok()
@@ -224,6 +224,9 @@ async fn run(
         }
     };
     let link: Arc<Mutex<Option<Link>>> = Arc::new(Mutex::new(None));
+    // 最近一次本地剪贴板：无连接时投递的变更没有队列，靠它在新连接建立后补发。
+    // 剪贴板是单值资源，只保留最新一条即可（与协议「只关心最新值」一致）。
+    let last: Arc<Mutex<Option<Profile>>> = Arc::new(Mutex::new(None));
 
     // ── 监听 ──
     let can_accept = listener.is_some();
@@ -232,6 +235,7 @@ async fn run(
             Arc::clone(&cfg.identity),
             Arc::clone(&store),
             Arc::clone(&link),
+            Arc::clone(&last),
             events.clone(),
             listener,
         ));
@@ -247,6 +251,7 @@ async fn run(
             cfg.clone(),
             Arc::clone(&store),
             Arc::clone(&link),
+            Arc::clone(&last),
             events.clone(),
         ));
     }
@@ -262,6 +267,7 @@ async fn run(
             cfg.clone(),
             Arc::clone(&store),
             Arc::clone(&link),
+            Arc::clone(&last),
             events.clone(),
         ));
     }
@@ -270,6 +276,11 @@ async fn run(
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             Cmd::Clipboard(profile) => {
+                // 先记下来：手机端是「按需上线」，投递时往往还没连接，
+                // 只丢弃会让对端连上后收不到最近一次复制（见 P2P-DEVICE-LINK §4）。
+                if let Ok(mut slot) = last.lock() {
+                    *slot = Some(profile.clone());
+                }
                 let sent = link
                     .lock()
                     .ok()
@@ -280,7 +291,7 @@ async fn run(
                     })
                     .unwrap_or(false);
                 if !sent {
-                    tracing::debug!("无活跃连接，本次剪贴板变更未发送");
+                    tracing::debug!("无活跃连接，本次剪贴板变更留待连接后补发");
                 }
             }
             Cmd::Stop => break,
@@ -292,6 +303,7 @@ async fn accept_loop(
     identity: Arc<Identity>,
     store: Arc<Mutex<PeerStore>>,
     link: Arc<Mutex<Option<Link>>>,
+    last: Arc<Mutex<Option<Profile>>>,
     events: std_mpsc::Sender<Event>,
     listener: Listener,
 ) {
@@ -311,6 +323,7 @@ async fn accept_loop(
         };
         let identity = Arc::clone(&identity);
         let link = Arc::clone(&link);
+        let last = Arc::clone(&last);
         let events = events.clone();
         let store = Arc::clone(&store);
         tokio::spawn(async move {
@@ -318,7 +331,7 @@ async fn accept_loop(
                 Ok(conn) => {
                     let peer_did = conn.peer_did().to_string();
                     remember_addr(&store, &peer_did, addr);
-                    serve(conn, link, events).await;
+                    serve(conn, link, last, events).await;
                 }
                 Err(e) => {
                     // 未配对设备连上来是常见情况（对面还在配对阶段），不当错误刷屏。
@@ -335,15 +348,16 @@ async fn connect_peer(
     cfg: NodeConfig,
     store: Arc<Mutex<PeerStore>>,
     link: Arc<Mutex<Option<Link>>>,
+    last: Arc<Mutex<Option<Profile>>>,
     events: std_mpsc::Sender<Event>,
 ) {
-    let Some(last) = peer.last_addr.clone() else {
+    let Some(last_addr) = peer.last_addr.clone() else {
         return;
     };
-    let Ok(addr) = last.parse::<std::net::SocketAddr>() else {
+    let Ok(addr) = last_addr.parse::<std::net::SocketAddr>() else {
         return;
     };
-    connect_peer_at(peer, addr, cfg, store, link, events).await;
+    connect_peer_at(peer, addr, cfg, store, link, last, events).await;
 }
 
 /// 连指定地址。成功后回写 `last_addr`，下次可直接复用。
@@ -353,6 +367,7 @@ async fn connect_peer_at(
     cfg: NodeConfig,
     store: Arc<Mutex<PeerStore>>,
     link: Arc<Mutex<Option<Link>>>,
+    last: Arc<Mutex<Option<Profile>>>,
     events: std_mpsc::Sender<Event>,
 ) {
     // 已有连接时不再叠加：局域网内同一对端两条连接只会互相顶掉。
@@ -369,7 +384,7 @@ async fn connect_peer_at(
     match session_initiate(stream, &cfg.identity, &peer).await {
         Ok(conn) => {
             remember_addr(&store, &peer.did, addr);
-            serve(conn, link, events).await;
+            serve(conn, link, last, events).await;
         }
         Err(e) => tracing::debug!("{} 握手失败：{e}", peer.name),
     }
@@ -379,6 +394,7 @@ async fn connect_peer_at(
 async fn serve(
     mut conn: Connection<TcpStream>,
     link: Arc<Mutex<Option<Link>>>,
+    last: Arc<Mutex<Option<Profile>>>,
     events: std_mpsc::Sender<Event>,
 ) {
     let did = conn.peer_did().to_string();
@@ -403,6 +419,14 @@ async fn serve(
             connected: true,
         },
     );
+
+    // 连上即同步：把缓存里最近一次本地剪贴板补发给对端。
+    // 对端按 hash 去重，重复内容不会写系统剪贴板，因此不会造成回声。
+    if let Some(profile) = last.lock().ok().and_then(|slot| slot.clone())
+        && let Err(e) = conn.send_clipboard(profile).await
+    {
+        tracing::debug!("向 {name} 补发剪贴板失败：{e}");
+    }
 
     // select 的结果先落到 `step`，等 select 结束再操作 conn——
     // 否则两个分支会同时借用 `conn`，借用检查过不去。
@@ -467,7 +491,7 @@ async fn announce_loop(identity: Arc<Identity>, port: u16) {
     let Ok(broadcaster) = Broadcaster::bind().await else {
         return;
     };
-    let ann = Announce::new(identity.did().to_hex(), port);
+    let ann = Announce::new(identity.did().to_hex(), port, AnnKind::Node);
     loop {
         // 广播失败不是致命问题（可能暂时没有可用网卡），下一轮再试。
         let _ = broadcaster.send(&ann).await;
@@ -480,6 +504,7 @@ async fn discover_loop(
     cfg: NodeConfig,
     store: Arc<Mutex<PeerStore>>,
     link: Arc<Mutex<Option<Link>>>,
+    last: Arc<Mutex<Option<Profile>>>,
     events: std_mpsc::Sender<Event>,
 ) {
     let Ok(watcher) = Watcher::bind().await else {
@@ -495,7 +520,16 @@ async fn discover_loop(
         if ann.did == my_did {
             continue;
         }
-        let Some(peer) = store.lock().ok().and_then(|s| s.get(&ann.did).cloned()) else {
+        // 配对会话的端口讲的是配对协议，拿来跑同步会话只会握手失败。
+        if ann.k == AnnKind::Pair {
+            continue;
+        }
+        // 每轮重新读盘：新配对是在设置进程里写进表的，常驻节点不重读就会一直
+        // 认为对方未配对——表现为「配完了，但要重启键盘才连上」。
+        let Some(peer) = store.lock().ok().and_then(|mut s| {
+            let _ = s.reload();
+            s.get(&ann.did).cloned()
+        }) else {
             continue;
         };
         // 公告里带的是对端真实端口（可能已顺延），不能假定为固定端口。
@@ -507,6 +541,7 @@ async fn discover_loop(
             cfg.clone(),
             Arc::clone(&store),
             Arc::clone(&link),
+            Arc::clone(&last),
             events.clone(),
         ));
     }
@@ -597,6 +632,54 @@ mod tests {
         .unwrap();
         assert_ne!(node.local_port(), 0, "实际端口必须可读");
         node.shutdown();
+    }
+
+    /// 手机端是「按需上线」：投递剪贴板时往往还没有连接。这类变更不能丢，
+    /// 对端连上后必须补发一次，否则表现为「键盘开了、连上了，但刚复制的内容收不到」。
+    #[test]
+    fn 无连接时投递的剪贴板会在连上后补发() {
+        let (_d1, p1) = temp_store();
+        let (_d2, p2) = temp_store();
+        let id1 = Arc::new(Identity::generate().unwrap());
+        let id2 = Arc::new(Identity::generate().unwrap());
+
+        let mut s1 = PeerStore::load(&p1).unwrap();
+        s1.upsert(PairedPeer::from_public(&id2.public("B"), None))
+            .unwrap();
+        s1.save().unwrap();
+
+        let a = Node::start(NodeConfig {
+            discover: false,
+            port: 0,
+            ..NodeConfig::new(Arc::clone(&id1), p1)
+        })
+        .unwrap();
+        // 此刻还没有任何连接：这条必须有缓存，否则测试拿不到。
+        assert!(a.set_clipboard(Profile::from_text("early", None)));
+
+        let mut s2 = PeerStore::load(&p2).unwrap();
+        s2.upsert(PairedPeer::from_public(&id1.public("A"), None))
+            .unwrap();
+        s2.set_last_addr(&id1.did().to_hex(), format!("127.0.0.1:{}", a.local_port()))
+            .unwrap();
+        s2.save().unwrap();
+
+        let b = Node::start(NodeConfig {
+            discover: false,
+            port: 0,
+            ..NodeConfig::new(Arc::clone(&id2), p2)
+        })
+        .unwrap();
+
+        let got = wait_for(
+            &b,
+            Duration::from_secs(10),
+            |e| matches!(e, Event::Clipboard(p) if p.text == "early"),
+        );
+        assert!(got.is_some(), "连上后未收到缓存的剪贴板");
+
+        a.shutdown();
+        b.shutdown();
     }
 
     #[test]
