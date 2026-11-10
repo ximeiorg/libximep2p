@@ -75,6 +75,12 @@ pub struct Profile {
     pub size: usize,
     /// 来源设备标识。
     pub source: Option<String>,
+    /// 发送端写入时刻（Unix 毫秒）。
+    ///
+    /// 跨通道 / 乱序时用它判定「谁更新」——剪贴板没有版本号，只靠到达顺序会在
+    /// 切换通道时用旧内容覆盖新内容。缺省 0 = 未知，未知一律不覆盖本地。
+    #[serde(default)]
+    pub ts: i64,
     /// 图片 RGBA8 裸字节（仅 image 类型携带，base64 序列化）。
     #[serde(
         default,
@@ -90,7 +96,21 @@ pub struct Profile {
     pub height: Option<u32>,
 }
 
+/// 当前 Unix 毫秒。时钟回拨时退化为 0，调用方按「未知」处理。
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 impl Profile {
+    /// 覆盖时间戳（宿主按「剪贴板实际变更时刻」写入时用，比构造时刻更准）。
+    pub fn with_ts(mut self, ts: i64) -> Self {
+        self.ts = ts;
+        self
+    }
+
     /// 由文本构造一个 text 类型 profile，自动计算 hash 与 size。
     pub fn from_text(text: impl Into<String>, source: Option<String>) -> Self {
         let text = text.into();
@@ -104,6 +124,7 @@ impl Profile {
             data_name: None,
             size,
             source,
+            ts: now_ms(),
             data: None,
             width: None,
             height: None,
@@ -122,6 +143,7 @@ impl Profile {
             data_name: None,
             size,
             source,
+            ts: now_ms(),
             data: Some(data),
             width: Some(width),
             height: Some(height),
@@ -138,6 +160,7 @@ impl Profile {
             data_name: None,
             size: 0,
             source,
+            ts: 0,
             data: None,
             width: None,
             height: None,

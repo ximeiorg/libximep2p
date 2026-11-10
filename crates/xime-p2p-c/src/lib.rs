@@ -102,6 +102,11 @@ fn event_json(e: Event) -> Value {
             name,
             connected,
         } => json!({ "type": "peer", "did": did, "name": name, "connected": connected }),
+        Event::Message { topic, payload } => {
+            // 负载是任意字节，用 base64 交给宿主（JS/ArkTS 侧再决定怎么解）。
+            let data = b64_encode(&payload);
+            json!({ "type": "message", "topic": topic, "data": data })
+        }
         Event::Warning(message) => json!({ "type": "warning", "message": message }),
     }
 }
@@ -180,6 +185,30 @@ pub extern "C" fn xime_p2p_stop() -> i32 {
             node.shutdown();
             1
         }
+        _ => 0,
+    }
+}
+
+/// base64 编解码（C ABI 层用，避免宿主再引依赖）。
+fn b64_encode(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// 投递一条业务无关的 topic 消息。返回 1 表示已入队（无连接时也会在连上后补发）。
+///
+/// 剪贴板也走同一入口（`topic = "clipboard"`），以后新增同步功能不必再加 C 函数。
+#[unsafe(no_mangle)]
+pub extern "C" fn xime_p2p_send_message(topic: *const c_char, payload: *const c_char) -> i32 {
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<bool, String> {
+        let topic = unsafe { arg(topic) }.ok_or("缺少 topic")?;
+        let payload = unsafe { arg(payload) }.ok_or("缺少 payload")?;
+        let guard = NODE.lock().map_err(|_| "状态锁不可用")?;
+        let node = guard.as_ref().ok_or("节点未启动")?;
+        Ok(node.send_message(topic, payload.into_bytes()))
+    }));
+    match result {
+        Ok(Ok(true)) => 1,
         _ => 0,
     }
 }

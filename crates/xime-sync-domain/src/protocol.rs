@@ -101,10 +101,15 @@ mod tests {
 
     #[test]
     fn client_message_clipboard_set_serializes() {
-        let p = Profile::from_text("hello", Some("device-a".to_string()));
+        // ts 固定成常量再断言：它是「写入时刻」，逐次变化，不能出现在精确比对的期望串里。
+        let p = Profile::from_text("hello", Some("device-a".to_string())).with_ts(1_700_000_000_000);
         let msg = ClientMessage::ClipboardSet { data: p };
         let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.starts_with(r#"{"type":"clipboard.set","data":{"type":"text","hash":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","text":"hello","has_data":false,"data_name":null,"size":5,"source":"device-a"}"#), "{json}");
+        assert_eq!(
+            json,
+            r#"{"type":"clipboard.set","data":{"type":"text","hash":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","text":"hello","has_data":false,"data_name":null,"size":5,"source":"device-a","ts":1700000000000}}"#,
+            "{json}"
+        );
     }
 
     #[test]

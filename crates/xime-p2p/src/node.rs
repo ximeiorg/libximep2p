@@ -10,6 +10,7 @@
 //! 这条「轮询而非回调」的边界是刻意划定的：它让 JNI 侧不需要处理线程附着，
 //! 也让桌面端不必改造成异步。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::mpsc as std_mpsc;
@@ -41,6 +42,8 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 pub enum Event {
     /// 收到远端剪贴板条目。
     Clipboard(Profile),
+    /// 收到某个 topic 的业务消息（剪贴板以外的新功能走这里）。
+    Message { topic: String, payload: Vec<u8> },
     /// 对端连接状态变化。
     Peer {
         did: String,
@@ -83,13 +86,22 @@ impl NodeConfig {
 /// 发往后台的指令。
 enum Cmd {
     Clipboard(Profile),
+    Message { topic: String, payload: Vec<u8> },
     Stop,
 }
 
 /// 发往某条连接的指令。
 enum Outbound {
     Clipboard(Profile),
+    Message { topic: String, payload: Vec<u8> },
     Close,
+}
+
+/// 各 topic 的最近一条消息，供新连接建立后补发。
+#[derive(Default)]
+struct Cache {
+    clipboard: Option<Profile>,
+    topics: HashMap<String, Vec<u8>>,
 }
 
 /// 当前活跃连接。剪贴板是单值资源，因此同一时刻只维护一条。
@@ -173,6 +185,19 @@ impl Node {
         self.cmd_tx.send(Cmd::Clipboard(profile)).is_ok()
     }
 
+    /// 投递一条业务无关的 topic 消息。
+    ///
+    /// 与 [`Self::set_clipboard`] 同理：无连接时节点会记住每 topic 的最新一条，
+    /// 等连接建立后补发。
+    pub fn send_message(&self, topic: impl Into<String>, payload: Vec<u8>) -> bool {
+        self.cmd_tx
+            .send(Cmd::Message {
+                topic: topic.into(),
+                payload,
+            })
+            .is_ok()
+    }
+
     /// 取一个事件，非阻塞。无事件返回 `None`。
     pub fn poll_event(&self) -> Option<Event> {
         self.events.lock().ok()?.try_recv().ok()
@@ -224,9 +249,9 @@ async fn run(
         }
     };
     let link: Arc<Mutex<Option<Link>>> = Arc::new(Mutex::new(None));
-    // 最近一次本地剪贴板：无连接时投递的变更没有队列，靠它在新连接建立后补发。
+    // 各 topic 的最近一条：无连接时投递的变更没有队列，靠它在新连接建立后补发。
     // 剪贴板是单值资源，只保留最新一条即可（与协议「只关心最新值」一致）。
-    let last: Arc<Mutex<Option<Profile>>> = Arc::new(Mutex::new(None));
+    let cache: Arc<Mutex<Cache>> = Arc::new(Mutex::new(Cache::default()));
 
     // ── 监听 ──
     let can_accept = listener.is_some();
@@ -235,7 +260,7 @@ async fn run(
             Arc::clone(&cfg.identity),
             Arc::clone(&store),
             Arc::clone(&link),
-            Arc::clone(&last),
+            Arc::clone(&cache),
             events.clone(),
             listener,
         ));
@@ -251,7 +276,7 @@ async fn run(
             cfg.clone(),
             Arc::clone(&store),
             Arc::clone(&link),
-            Arc::clone(&last),
+            Arc::clone(&cache),
             events.clone(),
         ));
     }
@@ -267,7 +292,7 @@ async fn run(
             cfg.clone(),
             Arc::clone(&store),
             Arc::clone(&link),
-            Arc::clone(&last),
+            Arc::clone(&cache),
             events.clone(),
         ));
     }
@@ -278,8 +303,8 @@ async fn run(
             Cmd::Clipboard(profile) => {
                 // 先记下来：手机端是「按需上线」，投递时往往还没连接，
                 // 只丢弃会让对端连上后收不到最近一次复制（见 P2P-DEVICE-LINK §4）。
-                if let Ok(mut slot) = last.lock() {
-                    *slot = Some(profile.clone());
+                if let Ok(mut cache) = cache.lock() {
+                    cache.clipboard = Some(profile.clone());
                 }
                 let sent = link
                     .lock()
@@ -294,6 +319,27 @@ async fn run(
                     tracing::debug!("无活跃连接，本次剪贴板变更留待连接后补发");
                 }
             }
+            Cmd::Message { topic, payload } => {
+                if let Ok(mut cache) = cache.lock() {
+                    cache.topics.insert(topic.clone(), payload.clone());
+                }
+                let sent = link
+                    .lock()
+                    .ok()
+                    .and_then(|guard| {
+                        guard.as_ref().map(|l| {
+                            l.tx.send(Outbound::Message {
+                                topic: topic.clone(),
+                                payload,
+                            })
+                            .is_ok()
+                        })
+                    })
+                    .unwrap_or(false);
+                if !sent {
+                    tracing::debug!("无活跃连接，消息 {topic} 留待连接后补发");
+                }
+            }
             Cmd::Stop => break,
         }
     }
@@ -303,7 +349,7 @@ async fn accept_loop(
     identity: Arc<Identity>,
     store: Arc<Mutex<PeerStore>>,
     link: Arc<Mutex<Option<Link>>>,
-    last: Arc<Mutex<Option<Profile>>>,
+    cache: Arc<Mutex<Cache>>,
     events: std_mpsc::Sender<Event>,
     listener: Listener,
 ) {
@@ -323,7 +369,7 @@ async fn accept_loop(
         };
         let identity = Arc::clone(&identity);
         let link = Arc::clone(&link);
-        let last = Arc::clone(&last);
+        let cache = Arc::clone(&cache);
         let events = events.clone();
         let store = Arc::clone(&store);
         tokio::spawn(async move {
@@ -331,7 +377,7 @@ async fn accept_loop(
                 Ok(conn) => {
                     let peer_did = conn.peer_did().to_string();
                     remember_addr(&store, &peer_did, addr);
-                    serve(conn, link, last, events).await;
+                    serve(conn, link, cache, events).await;
                 }
                 Err(e) => {
                     // 未配对设备连上来是常见情况（对面还在配对阶段），不当错误刷屏。
@@ -348,7 +394,7 @@ async fn connect_peer(
     cfg: NodeConfig,
     store: Arc<Mutex<PeerStore>>,
     link: Arc<Mutex<Option<Link>>>,
-    last: Arc<Mutex<Option<Profile>>>,
+    cache: Arc<Mutex<Cache>>,
     events: std_mpsc::Sender<Event>,
 ) {
     let Some(last_addr) = peer.last_addr.clone() else {
@@ -357,7 +403,7 @@ async fn connect_peer(
     let Ok(addr) = last_addr.parse::<std::net::SocketAddr>() else {
         return;
     };
-    connect_peer_at(peer, addr, cfg, store, link, last, events).await;
+    connect_peer_at(peer, addr, cfg, store, link, cache, events).await;
 }
 
 /// 连指定地址。成功后回写 `last_addr`，下次可直接复用。
@@ -367,7 +413,7 @@ async fn connect_peer_at(
     cfg: NodeConfig,
     store: Arc<Mutex<PeerStore>>,
     link: Arc<Mutex<Option<Link>>>,
-    last: Arc<Mutex<Option<Profile>>>,
+    cache: Arc<Mutex<Cache>>,
     events: std_mpsc::Sender<Event>,
 ) {
     // 已有连接时不再叠加：局域网内同一对端两条连接只会互相顶掉。
@@ -384,7 +430,7 @@ async fn connect_peer_at(
     match session_initiate(stream, &cfg.identity, &peer).await {
         Ok(conn) => {
             remember_addr(&store, &peer.did, addr);
-            serve(conn, link, last, events).await;
+            serve(conn, link, cache, events).await;
         }
         Err(e) => tracing::debug!("{} 握手失败：{e}", peer.name),
     }
@@ -394,7 +440,7 @@ async fn connect_peer_at(
 async fn serve(
     mut conn: Connection<TcpStream>,
     link: Arc<Mutex<Option<Link>>>,
-    last: Arc<Mutex<Option<Profile>>>,
+    cache: Arc<Mutex<Cache>>,
     events: std_mpsc::Sender<Event>,
 ) {
     let did = conn.peer_did().to_string();
@@ -422,10 +468,19 @@ async fn serve(
 
     // 连上即同步：把缓存里最近一次本地剪贴板补发给对端。
     // 对端按 hash 去重，重复内容不会写系统剪贴板，因此不会造成回声。
-    if let Some(profile) = last.lock().ok().and_then(|slot| slot.clone())
+    let (cached_clipboard, cached_topics) = cache
+        .lock()
+        .map(|c| (c.clipboard.clone(), c.topics.clone()))
+        .unwrap_or_default();
+    if let Some(profile) = cached_clipboard
         && let Err(e) = conn.send_clipboard(profile).await
     {
         tracing::debug!("向 {name} 补发剪贴板失败：{e}");
+    }
+    for (topic, payload) in cached_topics {
+        if let Err(e) = conn.send_message(&topic, payload).await {
+            tracing::debug!("向 {name} 补发 {topic} 失败：{e}");
+        }
     }
 
     // select 的结果先落到 `step`，等 select 结束再操作 conn——
@@ -442,6 +497,17 @@ async fn serve(
                         Ok(body) => emit(&events, Event::Clipboard(body.profile)),
                         Err(e) => warn(&events, format!("剪贴板帧解析失败：{e}")),
                     }
+                } else if frame.msg == MsgType::Message {
+                    match frame.parse_json::<crate::app::TopicMessage>() {
+                        Ok(body) => emit(
+                            &events,
+                            Event::Message {
+                                topic: body.topic,
+                                payload: body.payload.0,
+                            },
+                        ),
+                        Err(e) => warn(&events, format!("消息帧解析失败：{e}")),
+                    }
                 } else if frame.msg == MsgType::Ping {
                     // 协议要求对 PING 回 PONG；失败说明连接已坏，直接结束。
                     if conn.send(MsgType::Pong, b"{}").await.is_err() {
@@ -456,6 +522,12 @@ async fn serve(
             Step::Outbound(Some(Outbound::Clipboard(p))) => {
                 if let Err(e) = conn.send_clipboard(p).await {
                     tracing::debug!("向 {name} 发送失败：{e}");
+                    break;
+                }
+            }
+            Step::Outbound(Some(Outbound::Message { topic, payload })) => {
+                if let Err(e) = conn.send_message(&topic, payload).await {
+                    tracing::debug!("向 {name} 发送 {topic} 失败：{e}");
                     break;
                 }
             }
@@ -504,7 +576,7 @@ async fn discover_loop(
     cfg: NodeConfig,
     store: Arc<Mutex<PeerStore>>,
     link: Arc<Mutex<Option<Link>>>,
-    last: Arc<Mutex<Option<Profile>>>,
+    cache: Arc<Mutex<Cache>>,
     events: std_mpsc::Sender<Event>,
 ) {
     let Ok(watcher) = Watcher::bind().await else {
@@ -541,7 +613,7 @@ async fn discover_loop(
             cfg.clone(),
             Arc::clone(&store),
             Arc::clone(&link),
-            Arc::clone(&last),
+            Arc::clone(&cache),
             events.clone(),
         ));
     }
@@ -677,6 +749,63 @@ mod tests {
             |e| matches!(e, Event::Clipboard(p) if p.text == "early"),
         );
         assert!(got.is_some(), "连上后未收到缓存的剪贴板");
+
+        a.shutdown();
+        b.shutdown();
+    }
+
+    /// topic 消息是与剪贴板平行的通用入口：新功能（词库/主题等）以后只加 topic，
+    /// 不再动帧层与 Node 的结构。
+    #[test]
+    fn 两节点可互发_topic_消息() {
+        let (_d1, p1) = temp_store();
+        let (_d2, p2) = temp_store();
+        let id1 = Arc::new(Identity::generate().unwrap());
+        let id2 = Arc::new(Identity::generate().unwrap());
+
+        let mut s1 = PeerStore::load(&p1).unwrap();
+        s1.upsert(PairedPeer::from_public(&id2.public("B"), None))
+            .unwrap();
+        s1.save().unwrap();
+
+        let a = Node::start(NodeConfig {
+            discover: false,
+            port: 0,
+            ..NodeConfig::new(Arc::clone(&id1), p1)
+        })
+        .unwrap();
+
+        let mut s2 = PeerStore::load(&p2).unwrap();
+        s2.upsert(PairedPeer::from_public(&id1.public("A"), None))
+            .unwrap();
+        s2.set_last_addr(&id1.did().to_hex(), format!("127.0.0.1:{}", a.local_port()))
+            .unwrap();
+        s2.save().unwrap();
+
+        let b = Node::start(NodeConfig {
+            discover: false,
+            port: 0,
+            ..NodeConfig::new(Arc::clone(&id2), p2)
+        })
+        .unwrap();
+
+        assert!(
+            wait_for(&b, Duration::from_secs(10), |e| matches!(
+                e,
+                Event::Peer {
+                    connected: true,
+                    ..
+                }
+            ))
+            .is_some(),
+            "B 未观察到连接建立"
+        );
+
+        assert!(b.send_message("theme", b"theme-bytes".to_vec()));
+        let got = wait_for(&a, Duration::from_secs(10), |e| {
+            matches!(e, Event::Message { topic, payload } if topic == "theme" && payload == b"theme-bytes")
+        });
+        assert!(got.is_some(), "A 未收到 topic 消息");
 
         a.shutdown();
         b.shutdown();

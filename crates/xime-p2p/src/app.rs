@@ -11,7 +11,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use xime_sync_domain::profile::Profile;
 
 /// 协议版本号，出现在 `HELLO` / `HELLO_ACK` 的 `ver` 字段。
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 
 /// base64 包装：JSON 里是字符串，内存里是字节。
 #[derive(Clone, PartialEq, Eq, Default)]
@@ -113,6 +113,15 @@ pub struct IdentityPayload {
 pub struct ClipboardSet {
     pub profile: Profile,
     pub seq: u64,
+}
+
+/// `MESSAGE`（0x20）：业务无关的 topic 消息。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicMessage {
+    /// 业务标识，例如 `"clipboard"`。
+    pub topic: String,
+    /// 业务负载，序列化时 base64。
+    pub payload: B64,
 }
 
 /// `ERROR`（0x0C）。

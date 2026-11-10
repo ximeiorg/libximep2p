@@ -51,6 +51,10 @@ pub enum MsgType {
     Bye = 0x0D,
     /// Noise 握手消息载体（会话阶段，明文，payload 同样是 `{"msg": base64}`）。
     Noise = 0x0E,
+    /// 业务无关的 topic 消息：`{"topic": "...", "payload": base64}`。
+    ///
+    /// 剪贴板只是 `topic = "clipboard"` 的一个订阅者；以后新增同步功能不需要再动帧层。
+    Message = 0x20,
 }
 
 impl MsgType {
@@ -74,6 +78,7 @@ impl MsgType {
             0x0C => MsgType::Error,
             0x0D => MsgType::Bye,
             0x0E => MsgType::Noise,
+            0x20 => MsgType::Message,
             other => return Err(Error::UnknownMsgType(other)),
         })
     }

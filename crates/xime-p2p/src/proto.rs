@@ -16,7 +16,7 @@ use xime_sync_domain::profile::Profile;
 
 use crate::app::{
     B64, Bye, ClipboardSet, Confirm, ErrorMsg, Hello, HelloAck, IdentityPayload, PROTOCOL_VERSION,
-    SpakeMsg,
+    SpakeMsg, TopicMessage,
 };
 use crate::code::PairingCode;
 use crate::error::{Error, ErrorCode};
@@ -362,6 +362,18 @@ where
             seq: self.seq,
         };
         self.send_json(MsgType::ClipboardSet, &body).await
+    }
+
+    /// 发送一条业务无关的 topic 消息。
+    ///
+    /// 剪贴板走同一入口（`topic = "clipboard"`，负载是 `Profile` 的 JSON），
+    /// 以后新增同步功能只需定义新的 topic，不必扩展帧层。
+    pub async fn send_message(&mut self, topic: &str, payload: Vec<u8>) -> Result<(), Error> {
+        let body = TopicMessage {
+            topic: topic.to_string(),
+            payload: B64::new(payload),
+        };
+        self.send_json(MsgType::Message, &body).await
     }
 
     pub async fn ping(&mut self) -> Result<(), Error> {
