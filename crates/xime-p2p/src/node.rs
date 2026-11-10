@@ -802,9 +802,11 @@ mod tests {
         );
 
         assert!(b.send_message("theme", b"theme-bytes".to_vec()));
-        let got = wait_for(&a, Duration::from_secs(10), |e| {
-            matches!(e, Event::Message { topic, payload } if topic == "theme" && payload == b"theme-bytes")
-        });
+        let got = wait_for(
+            &a,
+            Duration::from_secs(10),
+            |e| matches!(e, Event::Message { topic, payload } if topic == "theme" && payload == b"theme-bytes"),
+        );
         assert!(got.is_some(), "A 未收到 topic 消息");
 
         a.shutdown();

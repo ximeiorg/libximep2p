@@ -378,13 +378,7 @@ pub extern "C" fn xime_p2p_pair_input(
                     ),
                     Err(e) => Err(xime_p2p::Error::Internal(format!("地址格式错误：{e}"))),
                 },
-                None => xime_p2p::join(
-                    identity,
-                    store,
-                    &code,
-                    name,
-                    Duration::from_secs(timeout),
-                ),
+                None => xime_p2p::join(identity, store, &code, name, Duration::from_secs(timeout)),
             };
             if let Ok(mut s) = thread_state.lock() {
                 match result {
@@ -543,11 +537,7 @@ mod tests {
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "xime-p2p-c-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("xime-p2p-c-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -616,7 +606,11 @@ mod tests {
         let started = call_json(xime_p2p_pair_display(dir_c.as_ptr(), name.as_ptr(), 30));
         assert_eq!(started["ok"], true, "配对启动失败：{started}");
         let code = started["code"].as_str().expect("缺少配对码");
-        assert_eq!(code.matches(char::is_numeric).count(), 6, "配对码应为 6 位数字");
+        assert_eq!(
+            code.matches(char::is_numeric).count(),
+            6,
+            "配对码应为 6 位数字"
+        );
 
         let waiting = call_json(xime_p2p_pair_poll());
         assert_eq!(waiting["phase"], "waiting");

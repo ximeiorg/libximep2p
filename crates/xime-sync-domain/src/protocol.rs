@@ -102,7 +102,8 @@ mod tests {
     #[test]
     fn client_message_clipboard_set_serializes() {
         // ts 固定成常量再断言：它是「写入时刻」，逐次变化，不能出现在精确比对的期望串里。
-        let p = Profile::from_text("hello", Some("device-a".to_string())).with_ts(1_700_000_000_000);
+        let p =
+            Profile::from_text("hello", Some("device-a".to_string())).with_ts(1_700_000_000_000);
         let msg = ClientMessage::ClipboardSet { data: p };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(
