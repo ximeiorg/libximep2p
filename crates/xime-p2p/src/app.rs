@@ -11,7 +11,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use xime_sync_domain::profile::Profile;
 
 /// 协议版本号，出现在 `HELLO` / `HELLO_ACK` 的 `ver` 字段。
-pub const PROTOCOL_VERSION: u8 = 2;
+///
+/// 只在**对外发布后出现不兼容变更**时才加一，作用是让新旧两端在握手阶段就明确拒绝，
+/// 而不是走到一半才失败。发布之前字段增删（如 `Profile.ts`、新的 `MsgType`）直接沿用 1，
+/// 不用版本号标记——否则会出现「同一个未发布协议，两台机器版本号不一样」的假不兼容。
+pub const PROTOCOL_VERSION: u8 = 1;
 
 /// base64 包装：JSON 里是字符串，内存里是字节。
 #[derive(Clone, PartialEq, Eq, Default)]
