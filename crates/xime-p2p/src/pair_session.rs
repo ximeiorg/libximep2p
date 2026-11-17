@@ -20,39 +20,115 @@ use crate::transport::{
     AnnKind, Announce, Broadcaster, Listener, PAIR_PORT, UDP_PORT, Watcher, connect,
 };
 
+/// 身份文件长度：32 字节 Ed25519 种子 + 32 字节 X25519 静态私钥。
+const IDENTITY_LEN: usize = 64;
+
+/// 等另一个进程写完身份的重试节奏（40 × 25ms ≈ 1 秒，远超写 64 字节的耗时）。
+const IDENTITY_WAIT_ATTEMPTS: u32 = 40;
+const IDENTITY_WAIT_INTERVAL: Duration = Duration::from_millis(25);
+
+/// 读取已落盘的身份；文件不存在或长度不对时返回 `None`。
+fn read_identity(path: &Path) -> Option<Identity> {
+    let bytes = std::fs::read(path).ok()?;
+    let arr = <[u8; IDENTITY_LEN]>::try_from(bytes.as_slice()).ok()?;
+    Some(Identity::from_bytes(&arr))
+}
+
+/// 独占创建文件（`O_EXCL`）：并发的多个进程里只有一个能成功。
+///
+/// Unix 上从创建那一刻就是 0600（`mode` 会被 umask 收窄，不会放宽），
+/// 避免「先按默认权限建、再 chmod」之间那段可读窗口。
+fn open_exclusive(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+/// 写 64 字节私钥并落盘。
+///
+/// `sync_all` 不能省：同机另一个进程此刻正在重试读取，半截内容会让它误判
+/// 「文件损坏」而生成第二份身份。
+fn write_identity(file: &mut std::fs::File, identity: &Identity) -> std::io::Result<()> {
+    use std::io::Write;
+    file.write_all(&identity.to_bytes())?;
+    file.sync_all()
+}
+
+/// 收紧到 0600。非 Unix（Windows）依赖用户目录的默认 ACL，不做权限位。
+#[cfg(unix)]
+fn restrict_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn restrict_permissions(_path: &Path) {}
+
+/// 反复重试读取，直到拿到合法身份或超时。
+fn wait_for_identity(path: &Path) -> Option<Identity> {
+    for _ in 0..IDENTITY_WAIT_ATTEMPTS {
+        std::thread::sleep(IDENTITY_WAIT_INTERVAL);
+        if let Some(identity) = read_identity(path) {
+            return Some(identity);
+        }
+    }
+    None
+}
+
+/// 原子替换：写临时文件后 rename，读方要么看到旧内容要么看到新内容。
+fn replace_identity(path: &Path, identity: &Identity) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    let mut file = open_exclusive(&tmp)?;
+    write_identity(&mut file, identity)?;
+    drop(file);
+    restrict_permissions(&tmp);
+    std::fs::rename(&tmp, path)
+}
+
 /// 加载或生成长期身份，落盘到 `dir/identity.bin`。
 ///
 /// 私钥文件权限必须 0600：同机其他用户读到就等于能冒充本设备完成配对，
 /// 而配对一旦被冒充，后续所有剪贴板内容都会流向攻击者。
-#[cfg(unix)]
+///
+/// **同一台机器上可能有多个进程同时首启**（桌面端是常驻输入法 + 设置程序，
+/// 两者都要用同一份身份）。旧实现是「读不到就生成再整文件写」，两边同时
+/// 走这条路就会各生成一份私钥、后写覆盖先写——已配对的设备随即全部失效，
+/// 界面上只表现为「突然同步不过来了」。现在用 `O_EXCL` 抢创建权：
+/// 只有赢家生成并落盘，输家等它写完后读取同一份。
 pub fn load_or_create_identity(dir: &Path) -> Option<Arc<Identity>> {
-    use std::os::unix::fs::PermissionsExt;
-
     let path = dir.join("identity.bin");
-    if let Ok(bytes) = std::fs::read(&path)
-        && let Ok(arr) = <[u8; 64]>::try_from(bytes.as_slice())
-    {
-        return Some(Arc::new(Identity::from_bytes(&arr)));
+    if let Some(identity) = read_identity(&path) {
+        return Some(Arc::new(identity));
     }
 
     let identity = Identity::generate().ok()?;
-    std::fs::write(&path, identity.to_bytes()).ok()?;
-    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    Some(Arc::new(identity))
-}
-
-/// 非 Unix 平台（Windows）：不做 POSIX 权限位，依赖用户目录的默认 ACL。
-#[cfg(not(unix))]
-pub fn load_or_create_identity(dir: &Path) -> Option<Arc<Identity>> {
-    let path = dir.join("identity.bin");
-    if let Ok(bytes) = std::fs::read(&path)
-        && let Ok(arr) = <[u8; 64]>::try_from(bytes.as_slice())
-    {
-        return Some(Arc::new(Identity::from_bytes(&arr)));
+    if path.exists() {
+        // 文件在但内容不合法：要么是另一个进程刚创建还没写完，要么是真损坏。
+        // 先让位等待；等不到才按损坏处理覆盖（旧行为），否则并发首启会分裂身份。
+        if let Some(existing) = wait_for_identity(&path) {
+            return Some(Arc::new(existing));
+        }
+        return replace_identity(&path, &identity)
+            .ok()
+            .map(|()| Arc::new(identity));
     }
-    let identity = Identity::generate().ok()?;
-    std::fs::write(&path, identity.to_bytes()).ok()?;
-    Some(Arc::new(identity))
+
+    match open_exclusive(&path).and_then(|mut file| write_identity(&mut file, &identity)) {
+        Ok(()) => {
+            restrict_permissions(&path);
+            Some(Arc::new(identity))
+        }
+        // 抢输了：另一个进程的身份才是本机身份，等它写完直接用。
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            wait_for_identity(&path).map(Arc::new)
+        }
+        Err(_) => None,
+    }
 }
 
 fn one_shot_runtime() -> Result<tokio::runtime::Runtime, Error> {
@@ -367,6 +443,46 @@ mod tests {
         load_or_create_identity(dir.path()).unwrap();
         let meta = std::fs::metadata(dir.path().join("identity.bin")).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    /// 同机两个进程（输入法 daemon / 设置程序）同时首启：必须收敛到同一份身份。
+    #[test]
+    fn 并发首启只生成一份身份() {
+        let dir = temp_dir();
+        let root = dir.path().to_path_buf();
+        let dids: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let root = root.clone();
+                    scope.spawn(move || load_or_create_identity(&root).unwrap().did().to_hex())
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(
+            dids.iter().all(|d| *d == dids[0]),
+            "并发首启必须复用同一份身份，实际: {dids:?}"
+        );
+        let len = std::fs::metadata(dir.path().join("identity.bin"))
+            .unwrap()
+            .len() as usize;
+        assert_eq!(len, IDENTITY_LEN, "落盘内容必须是一份完整私钥");
+    }
+
+    /// 文件被截断/写坏时仍要能恢复（旧行为不能被并发保护弄丢）。
+    #[test]
+    fn 损坏的身份文件会被替换() {
+        let dir = temp_dir();
+        std::fs::write(dir.path().join("identity.bin"), b"short").unwrap();
+        let a = load_or_create_identity(dir.path()).unwrap();
+        let b = load_or_create_identity(dir.path()).unwrap();
+        assert_eq!(a.did().to_hex(), b.did().to_hex());
+        assert_eq!(
+            std::fs::metadata(dir.path().join("identity.bin"))
+                .unwrap()
+                .len() as usize,
+            IDENTITY_LEN
+        );
     }
 
     /// 只有「对端真的回答过配对帧」的错误才该终结整次配对；连错了设备
