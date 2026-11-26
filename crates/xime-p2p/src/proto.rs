@@ -24,7 +24,7 @@ use crate::frame::{Frame, MsgType, read_frame, write_frame};
 use crate::identity::{Did, Identity, PublicIdentity};
 use crate::pairing::{PairKeys, SpakeSession, identity_aad};
 use crate::session::{NoiseHandshake, Session, prologue};
-use crate::store::{PairedPeer, PeerStore};
+use crate::store::{PairedPeer, PeerBook};
 
 /// 握手整体超时（§4.2：连接建立后 5 秒内未完成握手即断开）。
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -47,7 +47,7 @@ fn timeout_err(_: tokio::time::error::Elapsed) -> Error {
 
 /// Display 侧：显示动态码的一端。
 ///
-/// 成功返回对端公开身份（调用方据此写入 [`PeerStore`]，并补上已知地址）。
+/// 成功返回对端公开身份（调用方据此写入自己的 [`PeerBook`]，并补上已知地址）。
 pub async fn pair_as_display<S>(
     stream: &mut S,
     identity: &Identity,
@@ -441,7 +441,7 @@ where
 pub async fn session_accept<S>(
     stream: S,
     identity: &Identity,
-    store: &PeerStore,
+    store: &dyn PeerBook,
 ) -> Result<Connection<S>, Error>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -453,7 +453,7 @@ where
         let first = expect_frame(&mut stream, MsgType::Noise).await?;
 
         let mut matched: Option<(PairedPeer, NoiseHandshake)> = None;
-        for peer in store.all().take(MAX_PAIRING_CANDIDATES) {
+        for peer in store.all().into_iter().take(MAX_PAIRING_CANDIDATES) {
             let Ok(peer_did) = peer.did() else { continue };
             let pro = prologue(&peer_did, &my_did);
             let Ok(mut hs) = NoiseHandshake::responder(identity, &pro) else {
@@ -543,6 +543,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::MemoryPeerBook;
     use std::time::Instant;
 
     fn code(n: u32) -> PairingCode {
@@ -622,8 +623,7 @@ mod tests {
         let (server_id, server_peer) = paired(7, "Mac");
         let (client_id, client_peer) = paired(8, "Phone");
 
-        let mut store =
-            PeerStore::load(tempfile::tempdir().unwrap().path().join("peers.json")).unwrap();
+        let store = MemoryPeerBook::new();
         store.upsert(client_peer.clone()).unwrap();
 
         let (a, b) = tokio::io::duplex(256 * 1024);
@@ -658,8 +658,7 @@ mod tests {
         let (stranger_id, stranger_peer) = paired(11, "Stranger");
 
         // 服务端配对表里没有 11 号设备
-        let mut store =
-            PeerStore::load(tempfile::tempdir().unwrap().path().join("peers.json")).unwrap();
+        let store = MemoryPeerBook::new();
         store
             .upsert(PairedPeer::from_public(&identity(12).public("other"), None))
             .unwrap();
@@ -678,8 +677,7 @@ mod tests {
     async fn 会话中明文帧被拒绝() {
         let (server_id, server_peer) = paired(13, "Mac");
         let (client_id, client_peer) = paired(14, "Phone");
-        let mut store =
-            PeerStore::load(tempfile::tempdir().unwrap().path().join("peers.json")).unwrap();
+        let store = MemoryPeerBook::new();
         store.upsert(client_peer).unwrap();
 
         let (a, b) = tokio::io::duplex(64 * 1024);

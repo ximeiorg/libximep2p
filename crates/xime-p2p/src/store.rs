@@ -1,24 +1,30 @@
-//! 已配对设备表（§6.2）。
+//! 已配对设备：**读接口**与最小内存实现。
 //!
-//! 落盘为单个 JSON 文件，写入采用「临时文件 + rename」保证原子性：
-//! 中途断电只会丢失本次更新，不会留下半个文件把整张表读废。
+//! 存储不属于协议层。这个 crate 只认识「谁已经配对过」这件事——
+//! 它需要 `by_x25519` 来验证入站握手，需要 `set_last_addr` 记住上次连通的地址，
+//! 但**数据存在哪、用什么格式、要不要加密、谁负责迁移，全归客户端**：
 //!
-//! 与同步配置不同，**解析失败必须报错而不是回落默认值**：
-//! 表里是用户已建立的信任关系，静默清空等于把所有设备退回到未配对状态。
-//! 因此 [`PeerStore::load`] 在文件存在但内容非法时返回 [`Error::Store`]。
+//! | 宿主 | 实现 |
+//! |---|---|
+//! | macOS 桌面 | 统一库 `xime.db` 里的 `p2p_peers` 表（与 Android Room 对齐） |
+//! | Android | Room（界面侧已经在存） |
+//! | 鸿蒙 | 宿主自定，经 C ABI 传 JSON 进来 |
+//!
+//! 因此这里只有 [`PeerBook`] 这个 trait 和一个 [`MemoryPeerBook`]（供测试、
+//! 以及「宿主自己管持久化、只在启动时灌一次」的绑定层使用）。
+//! 协议层不引入任何数据库、不写任何文件。
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
 use crate::identity::{Did, PublicIdentity};
 
-/// 存储格式版本。升级格式时递增，并在此处做迁移。
-const STORE_VERSION: u32 = 1;
-
 /// 一个已配对的对端。
+///
+/// 这是**协议与信任记录**，不是存储格式：谁存、怎么存由宿主决定。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairedPeer {
     /// 设备标识，32 位小写 hex。
@@ -75,173 +81,142 @@ impl PairedPeer {
     }
 }
 
-/// 已配对设备表。
+/// 已配对设备的查询与更新。
 ///
-/// `Clone` 是有意提供的：连接处理需要在握手期间持有一份稳定快照，
-/// 避免与配对写入争锁。配对表只有几项，克隆成本可忽略。
-#[derive(Debug, Clone)]
-pub struct PeerStore {
-    path: PathBuf,
-    peers: BTreeMap<String, PairedPeer>,
+/// 实现方负责持久化与并发。**方法都取 `&self`**：节点会从多个任务同时调用，
+/// 实现内部自己加锁（或直接查库）。返回 owned 值，避免把实现的锁泄漏到协议层。
+pub trait PeerBook: Send + Sync {
+    /// 按 `did` 取一台设备。
+    fn get(&self, did: &str) -> Option<PairedPeer>;
+
+    /// 按 X25519 静态公钥反查。接入方用它把 Noise 握手识别到的密钥映射到设备。
+    fn by_x25519(&self, pub_x25519: &[u8; 32]) -> Option<PairedPeer>;
+
+    /// 全部已配对设备。节点用它做重连与状态展示。
+    fn all(&self) -> Vec<PairedPeer>;
+
+    /// 插入或更新信任锚（配对完成时调用）。
+    ///
+    /// **不应覆盖运行时状态**：重配对（换名字、换公钥）不该把学到的地址清掉。
+    fn upsert(&self, peer: PairedPeer) -> Result<(), Error>;
+
+    /// 删除一台设备，返回是否确实删掉了。
+    fn remove(&self, did: &str) -> Result<bool, Error>;
+
+    /// 记录最近一次成功连接的地址。
+    fn set_last_addr(&self, did: &str, addr: &str) -> Result<(), Error>;
+
+    /// 记录最后一次确认在线的时刻。
+    fn set_last_seen(&self, did: &str, at: i64) -> Result<(), Error>;
 }
 
-impl PeerStore {
-    /// 从磁盘加载；文件不存在视为空表。
-    pub fn load(path: impl Into<PathBuf>) -> Result<Self, Error> {
-        let path = path.into();
-        if !path.exists() {
-            return Ok(Self {
-                path,
-                peers: BTreeMap::new(),
-            });
-        }
-        let raw = std::fs::read_to_string(&path).map_err(|e| store_err(&path, e))?;
-        let file: StoreFile = serde_json::from_str(&raw).map_err(|e| {
-            Error::Store(format!(
-                "已配对表解析失败（{}）：{e}。文件未改动，请修复或删除后重新配对",
-                path.display()
-            ))
-        })?;
-        if file.version > STORE_VERSION {
-            return Err(Error::Store(format!(
-                "已配对表版本 {} 高于本程序支持的 {STORE_VERSION}",
-                file.version
-            )));
-        }
-        let peers = file
-            .peers
-            .into_iter()
-            .map(|p| (p.did.clone(), p))
-            .collect::<BTreeMap<_, _>>();
-        Ok(Self { path, peers })
+/// 纯内存实现。
+///
+/// 用途有两个：测试；以及绑定层（JNI / NAPI）——那里宿主自己管存储，
+/// 启动时把已配对设备灌进来，之后通过 [`crate::Node::status`] 读回运行时状态自行落盘。
+#[derive(Debug, Default)]
+pub struct MemoryPeerBook {
+    peers: Mutex<BTreeMap<String, PairedPeer>>,
+}
+
+impl MemoryPeerBook {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// 由一批设备构造（已有同 `did` 的按后者覆盖）。
+    pub fn from_peers(peers: impl IntoIterator<Item = PairedPeer>) -> Self {
+        let book = Self::new();
+        for peer in peers {
+            let _ = book.upsert(peer);
+        }
+        book
     }
 
-    /// 从磁盘重新读取配对表（内存内容被整体替换）。
-    ///
-    /// 设置应用与输入法是两个进程：配对在设置里完成，常驻的输入法进程若不重读，
-    /// 会一直认为新设备未配对——用户看到的是「配对成功了，但剪贴板同步不过来」。
-    /// 文件不存在视为空表（与 [`Self::load`] 一致）。
-    pub fn reload(&mut self) -> Result<(), Error> {
-        let fresh = Self::load(&self.path)?;
-        self.peers = fresh.peers;
+    /// 用一批设备整体替换现有内容（宿主配对/忘记之后同步用）。
+    pub fn replace_all(&self, peers: impl IntoIterator<Item = PairedPeer>) {
+        if let Ok(mut guard) = self.peers.lock() {
+            guard.clear();
+            for peer in peers {
+                guard.insert(peer.did.clone(), peer);
+            }
+        }
+    }
+}
+
+impl PeerBook for MemoryPeerBook {
+    fn get(&self, did: &str) -> Option<PairedPeer> {
+        self.peers.lock().ok()?.get(did).cloned()
+    }
+
+    fn by_x25519(&self, pub_x25519: &[u8; 32]) -> Option<PairedPeer> {
+        let want = hex::encode(pub_x25519);
+        self.peers
+            .lock()
+            .ok()?
+            .values()
+            .find(|p| p.pub_x25519 == want)
+            .cloned()
+    }
+
+    fn all(&self) -> Vec<PairedPeer> {
+        self.peers
+            .lock()
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn upsert(&self, peer: PairedPeer) -> Result<(), Error> {
+        let Ok(mut guard) = self.peers.lock() else {
+            return Err(Error::Store("设备表锁不可用".into()));
+        };
+        // 与持久化实现保持一致：信任锚更新，运行时状态保留。
+        let mut merged = peer;
+        if let Some(existing) = guard.get(&merged.did) {
+            merged.last_addr = merged.last_addr.or_else(|| existing.last_addr.clone());
+            merged.last_seen = merged.last_seen.or(existing.last_seen);
+        }
+        guard.insert(merged.did.clone(), merged);
         Ok(())
     }
 
-    pub fn len(&self) -> usize {
-        self.peers.len()
+    fn remove(&self, did: &str) -> Result<bool, Error> {
+        let Ok(mut guard) = self.peers.lock() else {
+            return Err(Error::Store("设备表锁不可用".into()));
+        };
+        Ok(guard.remove(did).is_some())
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.peers.is_empty()
-    }
-
-    pub fn get(&self, did: &str) -> Option<&PairedPeer> {
-        self.peers.get(did)
-    }
-
-    /// 按 X25519 静态公钥反查。Responder 用它把 Noise 握手识别到的密钥映射到设备。
-    pub fn by_x25519(&self, pub_x25519: &[u8; 32]) -> Option<&PairedPeer> {
-        let want = hex::encode(pub_x25519);
-        self.peers.values().find(|p| p.pub_x25519 == want)
-    }
-
-    pub fn all(&self) -> impl Iterator<Item = &PairedPeer> {
-        self.peers.values()
-    }
-
-    /// 插入或更新并立即落盘。
-    pub fn upsert(&mut self, peer: PairedPeer) -> Result<(), Error> {
-        self.peers.insert(peer.did.clone(), peer);
-        self.save()
-    }
-
-    /// 删除并落盘，返回是否确实删掉了。
-    pub fn remove(&mut self, did: &str) -> Result<bool, Error> {
-        let existed = self.peers.remove(did).is_some();
-        if existed {
-            self.save()?;
-        }
-        Ok(existed)
-    }
-
-    /// 记录最近一次成功连接的地址。
-    pub fn set_last_addr(&mut self, did: &str, addr: impl Into<String>) -> Result<(), Error> {
-        let addr = addr.into();
-        let Some(peer) = self.peers.get_mut(did) else {
+    fn set_last_addr(&self, did: &str, addr: &str) -> Result<(), Error> {
+        let Ok(mut guard) = self.peers.lock() else {
+            return Err(Error::Store("设备表锁不可用".into()));
+        };
+        let Some(peer) = guard.get_mut(did) else {
             return Err(Error::Store(format!("未找到已配对设备 {did}")));
         };
-        if peer.last_addr.as_deref() == Some(addr.as_str()) {
-            return Ok(());
-        }
-        peer.last_addr = Some(addr);
-        self.save()
+        peer.last_addr = Some(addr.to_string());
+        Ok(())
     }
 
-    /// 记录最后一次确认在线的时刻。
-    ///
-    /// 只在断开时写一次，不随心跳更新——否则每次心跳都要落盘。
-    pub fn set_last_seen(&mut self, did: &str, at: i64) -> Result<(), Error> {
-        let Some(peer) = self.peers.get_mut(did) else {
+    fn set_last_seen(&self, did: &str, at: i64) -> Result<(), Error> {
+        let Ok(mut guard) = self.peers.lock() else {
+            return Err(Error::Store("设备表锁不可用".into()));
+        };
+        let Some(peer) = guard.get_mut(did) else {
             return Err(Error::Store(format!("未找到已配对设备 {did}")));
         };
         if peer.last_seen.is_some_and(|prev| at <= prev) {
             return Ok(());
         }
         peer.last_seen = Some(at);
-        self.save()
-    }
-
-    /// 原子写入：写临时文件 → 落盘 → rename 覆盖。
-    pub fn save(&self) -> Result<(), Error> {
-        if let Some(parent) = self.path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(|e| store_err(parent, e))?;
-        }
-        let file = StoreFile {
-            version: STORE_VERSION,
-            peers: self.peers.values().cloned().collect(),
-        };
-        let json = serde_json::to_vec_pretty(&file)
-            .map_err(|e| Error::Store(format!("序列化已配对表失败: {e}")))?;
-
-        let tmp = self.path.with_extension("json.tmp");
-        {
-            use std::io::Write;
-            let mut f = std::fs::File::create(&tmp).map_err(|e| store_err(&tmp, e))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                // 表里是设备公钥与地址，不是秘密，但没必要让同机其他用户读到。
-                let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
-            }
-            f.write_all(&json).map_err(|e| store_err(&tmp, e))?;
-            f.sync_all().map_err(|e| store_err(&tmp, e))?;
-        }
-        std::fs::rename(&tmp, &self.path).map_err(|e| store_err(&self.path, e))?;
         Ok(())
     }
-}
-
-#[derive(Serialize, Deserialize)]
-struct StoreFile {
-    version: u32,
-    #[serde(default)]
-    peers: Vec<PairedPeer>,
 }
 
 fn decode32(value: &str, field: &str) -> Result<[u8; 32], Error> {
     let raw = hex::decode(value).map_err(|e| Error::Store(format!("{field} 不是合法 hex: {e}")))?;
     raw.try_into()
         .map_err(|_| Error::Store(format!("{field} 长度应为 32 字节")))
-}
-
-fn store_err(path: &Path, e: std::io::Error) -> Error {
-    Error::Store(format!("{}: {e}", path.display()))
 }
 
 fn now_unix() -> i64 {
@@ -262,100 +237,68 @@ mod tests {
     }
 
     #[test]
-    fn 插入后重新加载仍在() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("peers.json");
-
-        let mut store = PeerStore::load(&path).unwrap();
-        assert!(store.is_empty());
+    fn 插入后可查且按_x25519_反查() {
+        let book = MemoryPeerBook::new();
         let p = peer(1, "MacBook");
-        let did = p.did.clone();
-        store.upsert(p.clone()).unwrap();
-
-        let reloaded = PeerStore::load(&path).unwrap();
-        assert_eq!(reloaded.len(), 1);
-        let got = reloaded.get(&did).unwrap();
-        assert_eq!(got.name, "MacBook");
-        assert_eq!(got.pub_x25519, p.pub_x25519);
-        assert!(got.public_identity().is_ok());
-    }
-
-    #[test]
-    fn 按_x25519_反查() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = PeerStore::load(dir.path().join("peers.json")).unwrap();
-        let p = peer(2, "PC");
         let x: [u8; 32] = hex::decode(&p.pub_x25519).unwrap().try_into().unwrap();
-        store.upsert(p.clone()).unwrap();
+        book.upsert(p.clone()).unwrap();
 
-        assert_eq!(store.by_x25519(&x).unwrap().did, p.did);
-        assert!(store.by_x25519(&[0u8; 32]).is_none());
+        assert_eq!(book.get(&p.did).unwrap().name, "MacBook");
+        assert_eq!(book.by_x25519(&x).unwrap().did, p.did);
+        assert!(book.by_x25519(&[0u8; 32]).is_none());
+        assert_eq!(book.all().len(), 1);
     }
 
     #[test]
-    fn 删除后落盘() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("peers.json");
-        let mut store = PeerStore::load(&path).unwrap();
-        let p = peer(3, "Old");
+    fn 删除后不再出现() {
+        let book = MemoryPeerBook::new();
+        let p = peer(2, "Old");
         let did = p.did.clone();
-        store.upsert(p).unwrap();
-
-        assert!(store.remove(&did).unwrap());
-        assert!(!store.remove(&did).unwrap());
-        assert!(PeerStore::load(&path).unwrap().is_empty());
-    }
-
-    #[test]
-    fn 记录上次地址且不重复写盘() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = PeerStore::load(dir.path().join("peers.json")).unwrap();
-        let p = peer(4, "Laptop");
-        let did = p.did.clone();
-        store.upsert(p).unwrap();
-
-        store.set_last_addr(&did, "192.168.1.9:47821").unwrap();
-        assert_eq!(
-            store.get(&did).unwrap().last_addr.as_deref(),
-            Some("192.168.1.9:47821")
-        );
-        store.set_last_addr(&did, "192.168.1.9:47821").unwrap();
-        let reloaded = PeerStore::load(store.path()).unwrap();
-        assert_eq!(
-            reloaded.get(&did).unwrap().last_addr.as_deref(),
-            Some("192.168.1.9:47821")
-        );
+        book.upsert(p.clone()).unwrap();
+        assert!(book.remove(&did).unwrap());
+        assert!(!book.remove(&did).unwrap());
+        assert!(book.all().is_empty());
     }
 
     #[test]
     fn 未配对设备写地址时报错() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = PeerStore::load(dir.path().join("peers.json")).unwrap();
-        assert!(store.set_last_addr("deadbeef", "1.2.3.4:1").is_err());
+        let book = MemoryPeerBook::new();
+        assert!(book.set_last_addr("deadbeef", "1.2.3.4:1").is_err());
+    }
+
+    /// 重配对（换名字）不能把学到的地址清掉——地址是运行时状态，不属于信任锚。
+    #[test]
+    fn 重新配对保留运行时状态() {
+        let book = MemoryPeerBook::new();
+        let p = peer(3, "Old name");
+        let did = p.did.clone();
+        book.upsert(p.clone()).unwrap();
+        book.set_last_addr(&did, "10.0.0.2:47821").unwrap();
+        book.set_last_seen(&did, 100).unwrap();
+
+        let mut renamed = p;
+        renamed.name = "New name".to_string();
+        book.upsert(renamed).unwrap();
+
+        let got = book.get(&did).unwrap();
+        assert_eq!(got.name, "New name");
+        assert_eq!(got.last_addr.as_deref(), Some("10.0.0.2:47821"));
+        assert_eq!(got.last_seen, Some(100));
     }
 
     #[test]
-    fn 文件损坏时报错而非清空() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("peers.json");
-        std::fs::write(&path, "{ this is not json").unwrap();
-        let err = PeerStore::load(&path).unwrap_err();
-        assert!(matches!(err, Error::Store(_)));
-        // 原文件必须保持不变，便于人工修复
-        assert!(std::fs::read_to_string(&path).unwrap().contains("not json"));
-    }
-
-    #[test]
-    fn 高版本表被拒绝() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("peers.json");
-        std::fs::write(&path, r#"{"version":99,"peers":[]}"#).unwrap();
-        assert!(matches!(PeerStore::load(&path), Err(Error::Store(_))));
+    fn 整体替换用于宿主回灌() {
+        let book = MemoryPeerBook::from_peers([peer(4, "A"), peer(5, "B")]);
+        assert_eq!(book.all().len(), 2);
+        book.replace_all([peer(6, "C")]);
+        let all = book.all();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "C");
     }
 
     #[test]
     fn 篡改_did_后身份校验失败() {
-        let mut p = peer(5, "Victim");
+        let mut p = peer(7, "Victim");
         p.did = "00".repeat(16);
         assert!(p.public_identity().is_err());
     }

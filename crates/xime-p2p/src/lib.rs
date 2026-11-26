@@ -46,7 +46,7 @@ pub use pair_session::{DisplaySession, StopHandle, join, join_at, load_or_create
 pub use pairing::PairKeys;
 pub use proto::{Connection, pair_as_display, pair_as_input, session_accept, session_initiate};
 pub use session::{NoiseHandshake, Session};
-pub use store::{PairedPeer, PeerStore};
+pub use store::{MemoryPeerBook, PairedPeer, PeerBook};
 // 供宿主构造剪贴板条目，省得它们再单独依赖 xime-sync-domain。
 pub use transport::{
     Announce, Broadcaster, Listener, PAIR_PORT, TCP_PORT, UDP_PORT, Watcher, connect,

@@ -7,7 +7,7 @@
 //! 路径策略（身份存哪、配对表存哪）不在这里决定，由宿主传入，四端各自适配。
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,7 @@ use crate::code::PairingCode;
 use crate::error::Error;
 use crate::identity::{Identity, PublicIdentity};
 use crate::proto::{pair_as_display, pair_as_input};
-use crate::store::{PairedPeer, PeerStore};
+use crate::store::{PairedPeer, PeerBook};
 use crate::transport::{
     AnnKind, Announce, Broadcaster, Listener, PAIR_PORT, UDP_PORT, Watcher, connect,
 };
@@ -140,12 +140,12 @@ fn one_shot_runtime() -> Result<tokio::runtime::Runtime, Error> {
         .map_err(Error::Io)
 }
 
-fn save_peer(store_path: &Path, public: &PublicIdentity) -> Result<(), Error> {
-    let mut store = PeerStore::load(store_path)?;
-    // 不写 last_addr：显示端此时并不知道自己的同步端口（可能已顺延），
-    // 写一个猜测值会让下次重连指向错误端口。真实地址在首次连接成功后回写。
-    store.upsert(PairedPeer::from_public(public, None))?;
-    store.save()
+/// 配对成功后写入宿主的设备表。
+///
+/// 不写 last_addr：显示端此时并不知道自己的同步端口（可能已顺延），
+/// 写一个猜测值会让下次重连指向错误端口。真实地址在首次连接成功后回写。
+fn save_peer(peers: &dyn PeerBook, public: &PublicIdentity) -> Result<(), Error> {
+    peers.upsert(PairedPeer::from_public(public, None))
 }
 
 /// 显示端会话的取消句柄。
@@ -172,7 +172,7 @@ pub struct DisplaySession {
     identity: Arc<Identity>,
     code: PairingCode,
     name: String,
-    store_path: PathBuf,
+    peers: Arc<dyn PeerBook>,
     /// 取消标志。用户在界面上点「取消」或重新生成码时置位，
     /// 让阻塞在 [`Self::wait`] 里的线程退出并及时释放配对端口。
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -184,7 +184,7 @@ impl DisplaySession {
     /// 返回后立刻可以用 [`Self::code_text`] 把码显示给用户。
     pub fn start(
         identity: Arc<Identity>,
-        store_path: PathBuf,
+        peers: Arc<dyn PeerBook>,
         name: impl Into<String>,
     ) -> Result<Self, Error> {
         let code = PairingCode::generate()?;
@@ -198,7 +198,7 @@ impl DisplaySession {
             identity,
             code,
             name: name.into(),
-            store_path,
+            peers,
             stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
@@ -242,7 +242,7 @@ impl DisplaySession {
         let identity = Arc::clone(&self.identity);
         let code = self.code;
         let name = self.name.clone();
-        let store_path = self.store_path.clone();
+        let peers = Arc::clone(&self.peers);
         let listener = &self.listener;
         let broadcaster = &self.broadcaster;
         let stop = Arc::clone(&self.stop);
@@ -278,7 +278,7 @@ impl DisplaySession {
 
                 match pair_as_display(&mut stream, &identity, &name, &code).await {
                     Ok(public) => {
-                        save_peer(&store_path, &public)?;
+                        save_peer(peers.as_ref(), &public)?;
                         return Ok(public);
                     }
                     // 输错码 / 版本不符 / 对端中途断开都归到这里，继续等下一个。
@@ -295,7 +295,7 @@ impl DisplaySession {
 /// 另一个实例正在做发现），返回明确的错误而不是静默超时。
 pub fn join(
     identity: Arc<Identity>,
-    store_path: PathBuf,
+    peers: Arc<dyn PeerBook>,
     code_input: &str,
     name: impl Into<String>,
     timeout: Duration,
@@ -355,7 +355,7 @@ pub fn join(
             };
             match pair_as_input(&mut stream, &identity, &name, &code).await {
                 Ok(public) => {
-                    save_peer(&store_path, &public)?;
+                    save_peer(peers.as_ref(), &public)?;
                     return Ok(public);
                 }
                 // 对端答复了配对协议（码错 / 被占用 / 版本不符）：换一台也救不回来，
@@ -393,7 +393,7 @@ fn answered_pairing(err: &Error) -> bool {
 /// 仍然可用——它是发现失败时的兜底。
 pub fn join_at(
     identity: Arc<Identity>,
-    store_path: PathBuf,
+    peers: Arc<dyn PeerBook>,
     code_input: &str,
     name: impl Into<String>,
     addr: std::net::SocketAddr,
@@ -406,7 +406,7 @@ pub fn join_at(
     rt.block_on(async move {
         let mut stream = connect(addr, timeout).await?;
         let public = pair_as_input(&mut stream, &identity, &name, &code).await?;
-        save_peer(&store_path, &public)?;
+        save_peer(peers.as_ref(), &public)?;
         Ok(public)
     })
 }
@@ -421,6 +421,7 @@ fn parse_code(code_input: &str) -> Result<PairingCode, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::MemoryPeerBook;
     use std::time::Duration;
 
     fn temp_dir() -> tempfile::TempDir {
@@ -569,12 +570,12 @@ mod tests {
     fn 双端可完成配对() {
         let dir_a = temp_dir();
         let dir_b = temp_dir();
-        let store_a = dir_a.path().join("peers.json");
-        let store_b = dir_b.path().join("peers.json");
+        let store_a: Arc<dyn PeerBook> = Arc::new(MemoryPeerBook::new());
+        let store_b: Arc<dyn PeerBook> = Arc::new(MemoryPeerBook::new());
         let id_a = load_or_create_identity(dir_a.path()).unwrap();
         let id_b = load_or_create_identity(dir_b.path()).unwrap();
 
-        let mut display = DisplaySession::start(Arc::clone(&id_a), store_a.clone(), "Mac")
+        let mut display = DisplaySession::start(Arc::clone(&id_a), Arc::clone(&store_a), "Mac")
             .expect("显示端启动失败");
         let code = display.code_text();
         let port = display.local_port().unwrap();
@@ -583,7 +584,7 @@ mod tests {
 
         let joined = join_at(
             Arc::clone(&id_b),
-            store_b.clone(),
+            Arc::clone(&store_b),
             &code,
             "Phone",
             std::net::SocketAddr::from(([127, 0, 0, 1], port)),
@@ -599,12 +600,12 @@ mod tests {
         assert_eq!(joined.did().to_hex(), id_a.did().to_hex());
 
         // 配对表两侧都应写入对端。
-        let a = PeerStore::load(&store_a).unwrap();
-        let b = PeerStore::load(&store_b).unwrap();
+        let a = store_a.all();
+        let b = store_b.all();
         assert_eq!(a.len(), 1);
         assert_eq!(b.len(), 1);
-        assert!(a.get(&id_b.did().to_hex()).is_some());
-        assert!(b.get(&id_a.did().to_hex()).is_some());
+        assert!(a.iter().any(|p| p.did == id_b.did().to_hex()));
+        assert!(b.iter().any(|p| p.did == id_a.did().to_hex()));
     }
 
     /// 码不对时必须失败，且不能把对端写进配对表。
@@ -612,12 +613,12 @@ mod tests {
     fn 错误动态码配对失败() {
         let dir_a = temp_dir();
         let dir_b = temp_dir();
-        let store_a = dir_a.path().join("peers.json");
-        let store_b = dir_b.path().join("peers.json");
+        let store_a: Arc<dyn PeerBook> = Arc::new(MemoryPeerBook::new());
+        let store_b: Arc<dyn PeerBook> = Arc::new(MemoryPeerBook::new());
         let id_a = load_or_create_identity(dir_a.path()).unwrap();
         let id_b = load_or_create_identity(dir_b.path()).unwrap();
 
-        let mut display = DisplaySession::start(Arc::clone(&id_a), store_a.clone(), "Mac")
+        let mut display = DisplaySession::start(Arc::clone(&id_a), Arc::clone(&store_a), "Mac")
             .expect("显示端启动失败");
         let port = display.local_port().unwrap();
         let right = display.code_text();
@@ -633,7 +634,7 @@ mod tests {
         let wait_handle = std::thread::spawn(move || display.wait(Duration::from_secs(3)));
         let joined = join_at(
             Arc::clone(&id_b),
-            store_b.clone(),
+            Arc::clone(&store_b),
             wrong,
             "Phone",
             std::net::SocketAddr::from(([127, 0, 0, 1], port)),
@@ -642,8 +643,7 @@ mod tests {
 
         assert!(joined.is_err(), "错误码不应配对成功");
         // 输入端不能留下对端记录。
-        let b = PeerStore::load(&store_b).unwrap();
-        assert!(b.is_empty(), "失败配对不应写入配对表");
+        assert!(store_b.all().is_empty(), "失败配对不应写入配对表");
         // 显示端仍在等下一个连接，超时后返回错误（不是 panic）。
         let _ = wait_handle.join();
     }

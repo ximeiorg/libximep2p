@@ -10,16 +10,23 @@
 
 use std::ffi::{CStr, CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{Value, json};
-use xime_p2p::{DisplaySession, Event, Identity, Node, NodeConfig, PeerStore, Profile};
+use xime_p2p::{
+    DisplaySession, Event, Identity, MemoryPeerBook, Node, NodeConfig, PairedPeer, PeerBook, Profile,
+};
 
 /// 常驻同步节点（同一进程只有一个）。
 static NODE: Mutex<Option<Node>> = Mutex::new(None);
+/// 已配对设备的进程内副本。
+///
+/// **存储归宿主**：这一层只保存一份内存镜像，宿主用 [`xime_p2p_set_peers`] 灌入，
+/// 配对成功后用 [`xime_p2p_peers`] 读回再写自己的库（Room / 文件 / 其它）。
+static BOOK: Mutex<Option<Arc<MemoryPeerBook>>> = Mutex::new(None);
 /// 当前配对任务。
 static PAIR: Mutex<Option<PairJob>> = Mutex::new(None);
 
@@ -90,8 +97,12 @@ fn identity_for(dir: &str) -> Result<Arc<Identity>, String> {
         .ok_or_else(|| "身份不可用（系统随机源异常）".to_string())
 }
 
-fn store_path(dir: &str) -> PathBuf {
-    Path::new(dir).join("peers.json")
+/// 取（必要时创建）进程内设备表。
+fn book() -> Result<Arc<MemoryPeerBook>, String> {
+    let mut guard = BOOK.lock().map_err(|_| "设备表锁不可用")?;
+    Ok(Arc::clone(
+        guard.get_or_insert_with(|| Arc::new(MemoryPeerBook::new())),
+    ))
 }
 
 fn event_json(e: Event) -> Value {
@@ -148,7 +159,8 @@ pub extern "C" fn xime_p2p_start(
         let dir = unsafe { arg(dir) }.ok_or("缺少目录参数")?;
         let identity = identity_for(&dir)?;
 
-        let mut cfg = NodeConfig::new(identity, store_path(&dir));
+        // 设备表是进程内镜像：宿主启动时用 `xime_p2p_set_peers` 灌一次。
+        let mut cfg = NodeConfig::new(identity, book()?);
         cfg.listen = listen != 0;
         cfg.discover = discover != 0;
         if port > 0 {
@@ -293,7 +305,7 @@ pub extern "C" fn xime_p2p_pair_display(
 
         cancel_pair_locked();
 
-        let mut session = DisplaySession::start(identity, store_path(&dir), name)
+        let mut session = DisplaySession::start(identity, book()?, name)
             .map_err(|e| format!("配对启动失败：{e}"))?;
         let code = session.code_text();
         let port = session.local_port().map_err(|e| e.to_string())?;
@@ -370,14 +382,14 @@ pub extern "C" fn xime_p2p_pair_input(
         }));
 
         let thread_state = Arc::clone(&state);
-        let store = store_path(&dir);
+        let book = book()?;
         let timeout = timeout_sec.clamp(10, 300) as u64;
         std::thread::spawn(move || {
             let result = match addr {
                 Some(addr) => match addr.parse::<std::net::SocketAddr>() {
                     Ok(socket) => xime_p2p::join_at(
                         identity,
-                        store,
+                        book,
                         &code,
                         name,
                         socket,
@@ -385,7 +397,7 @@ pub extern "C" fn xime_p2p_pair_input(
                     ),
                     Err(e) => Err(xime_p2p::Error::Internal(format!("地址格式错误：{e}"))),
                 },
-                None => xime_p2p::join(identity, store, &code, name, Duration::from_secs(timeout)),
+                None => xime_p2p::join(identity, book, &code, name, Duration::from_secs(timeout)),
             };
             if let Ok(mut s) = thread_state.lock() {
                 match result {
@@ -463,42 +475,39 @@ pub extern "C" fn xime_p2p_pair_cancel() -> i32 {
 
 // ─────────────────────────── 已配对设备 ───────────────────────────
 
-/// 已配对设备列表：`{ok,peers:[{did,name,last_addr,last_seen,paired_at}]}`。
+/// 已配对设备列表：`{ok,peers:[PairedPeer...]}`。
 ///
-/// 这里读的是磁盘，不含实时状态；要在线状态用 [`xime_p2p_status`]。
+/// 读的是**进程内镜像**。持久化归宿主：配对完成或修改后调它读回、写进自己的库。
 #[unsafe(no_mangle)]
-pub extern "C" fn xime_p2p_peers(dir: *const c_char) -> *mut c_char {
+pub extern "C" fn xime_p2p_peers() -> *mut c_char {
     guard(|| {
-        let dir = unsafe { arg(dir) }.ok_or("缺少目录参数")?;
-        let store = PeerStore::load(store_path(&dir)).map_err(|e| e.to_string())?;
-        let peers: Vec<Value> = store
-            .all()
-            .map(|p| {
-                json!({
-                    "did": p.did,
-                    "name": p.name,
-                    "last_addr": p.last_addr,
-                    "last_seen": p.last_seen,
-                    "paired_at": p.paired_at,
-                })
-            })
-            .collect();
-        Ok(json!({ "ok": true, "peers": peers }))
+        let book = book()?;
+        Ok(json!({ "ok": true, "peers": book.all() }))
     })
 }
 
-/// 删除一个已配对设备。返回 1 表示确实删掉了。
+/// 用宿主自己的存储覆盖进程内设备表。
+///
+/// 入参是 `PairedPeer` 数组的 JSON。节点启动前、配对后、忘记设备后都应调一次。
 #[unsafe(no_mangle)]
-pub extern "C" fn xime_p2p_forget(dir: *const c_char, did: *const c_char) -> i32 {
+pub extern "C" fn xime_p2p_set_peers(peers_json: *const c_char) -> *mut c_char {
+    guard(|| {
+        let raw = unsafe { arg(peers_json) }.ok_or("缺少设备列表")?;
+        let peers: Vec<PairedPeer> =
+            serde_json::from_str(&raw).map_err(|e| format!("设备列表解析失败：{e}"))?;
+        let book = book()?;
+        book.replace_all(peers);
+        Ok(json!({ "ok": true, "count": book.all().len() }))
+    })
+}
+
+/// 删除一个已配对设备（只改进程内镜像，宿主自己要同步删库）。返回 1 表示确实删掉了。
+#[unsafe(no_mangle)]
+pub extern "C" fn xime_p2p_forget(did: *const c_char) -> i32 {
     let result = catch_unwind(AssertUnwindSafe(|| -> Result<bool, String> {
-        let dir = unsafe { arg(dir) }.ok_or("缺少目录参数")?;
         let did = unsafe { arg(did) }.ok_or("缺少 did")?;
-        let mut store = PeerStore::load(store_path(&dir)).map_err(|e| e.to_string())?;
-        let removed = store.remove(&did).map_err(|e| e.to_string())?;
-        if removed {
-            store.save().map_err(|e| e.to_string())?;
-        }
-        Ok(removed)
+        let book = book()?;
+        book.remove(&did).map_err(|e| e.to_string())
     }));
     match result {
         Ok(Ok(true)) => 1,
@@ -546,7 +555,7 @@ mod tests {
         CString::new(text).unwrap()
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("xime-p2p-c-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -604,12 +613,12 @@ mod tests {
         let dir = temp_dir("peers");
         let dir_c = c(dir.to_str().unwrap());
 
-        let peers = call_json(xime_p2p_peers(dir_c.as_ptr()));
+        let peers = call_json(xime_p2p_peers());
         assert_eq!(peers["ok"], true);
         assert!(peers["peers"].as_array().unwrap().is_empty());
 
         let did = c("00000000000000000000000000000000");
-        assert_eq!(xime_p2p_forget(dir_c.as_ptr(), did.as_ptr()), 0);
+        assert_eq!(xime_p2p_forget(did.as_ptr()), 0);
     }
 
     #[test]

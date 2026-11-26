@@ -29,8 +29,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -45,7 +44,7 @@ use crate::error::Error;
 use crate::frame::{Frame, MsgType};
 use crate::identity::Identity;
 use crate::proto::{Connection, session_accept, session_initiate};
-use crate::store::{PairedPeer, PeerStore};
+use crate::store::{PairedPeer, PeerBook};
 use crate::transport::{AnnKind, Announce, Broadcaster, Listener, TCP_PORT, Watcher, connect};
 
 /// 广播间隔。局域网内设备少，3 秒足够让对端在可感知的时间内发现。
@@ -54,20 +53,44 @@ const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(3);
 const WATCH_SLICE: Duration = Duration::from_secs(2);
 /// 默认连接超时。局域网直连要么很快成功，要么就是不通，等太久没有意义。
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-/// 心跳间隔。
+/// 前台心跳间隔。
 ///
 /// **必须明显小于 [`crate::proto::IDLE_TIMEOUT`]（30 秒）**：`Connection::recv`
 /// 自带 30 秒读超时，而协议里没有任何一方会主动发帧。两端都沉默时，空闲连接
 /// 会被对端判成断开——表现为「连上 30 秒后自己掉线，过一会儿又连上」。
 /// 心跳顺带把死连接检测从 TCP 重传级（分钟级）压到秒级。
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const HEARTBEAT_FOREGROUND: Duration = Duration::from_secs(10);
+/// 后台（锁屏 / 应用不可见）心跳间隔。
+///
+/// 仍必须小于 30 秒——对端的读超时是写死的，拉长只会被判死。手机后台再省，
+/// 也不能省到断线。真正的省电靠「蜂窝下不跑」和「重试退避」。
+const HEARTBEAT_BACKGROUND: Duration = Duration::from_secs(25);
+/// 心跳定时器的检查粒度：到达间隔才真正发 PING。
+///
+/// 用固定小步长 + 比较经过时间，而不是每次重建 `interval`，
+/// 这样前后台切换时可以即时生效，不用重启连接任务。
+const HEARTBEAT_TICK: Duration = Duration::from_secs(5);
 /// 在场判定窗口：公告周期 3 秒，容忍连丢三次。
 const PRESENCE_TTL: Duration = Duration::from_secs(12);
-/// 已配对但未连接时的重试间隔。
+/// 重试退避：连不上时逐级拉长，连上即归零。
 ///
-/// 发现循环只在收到公告时才发起连接；公告被广播域、AP 隔离或多网卡挡住时，
-/// 没有这条重试就再也连不上了。
-const RETRY_INTERVAL: Duration = Duration::from_secs(5);
+/// 固定 5 秒重试在「对端长期不在线」时一天要拨 1.7 万次，手机会一直唤醒射频。
+/// 一秒一次的空转检查本身不耗电（纯内存比较）。
+const RETRY_BACKOFF: [Duration; 5] = [
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(300),
+];
+/// 重试循环的检查粒度。
+const RETRY_TICK: Duration = Duration::from_secs(1);
+
+/// 第 `failures` 次连续失败后应等待的时长（从 1 数）。
+fn retry_delay(failures: u32) -> Duration {
+    let idx = (failures.saturating_sub(1) as usize).min(RETRY_BACKOFF.len() - 1);
+    RETRY_BACKOFF[idx]
+}
 
 /// 会话令牌计数器。进程内单调递增，用于区分同一台设备的先后会话。
 static TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -142,8 +165,8 @@ pub struct NodeStatus {
 pub struct NodeConfig {
     /// 本机长期身份。多处共享使用，故用 `Arc`。
     pub identity: Arc<Identity>,
-    /// 已配对表路径。
-    pub store_path: PathBuf,
+    /// 已配对设备的来源。**存哪由宿主决定**，协议层只查询与更新。
+    pub peers: Arc<dyn PeerBook>,
     /// 是否监听入站连接。桌面端通常 `true`；手机端可设 `false` 只主动连。
     pub listen: bool,
     /// 是否周期广播 + 监听公告。关闭后只能靠「上次地址」重连。
@@ -154,10 +177,10 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
-    pub fn new(identity: Arc<Identity>, store_path: impl Into<PathBuf>) -> Self {
+    pub fn new(identity: Arc<Identity>, peers: Arc<dyn PeerBook>) -> Self {
         Self {
             identity,
-            store_path: store_path.into(),
+            peers,
             listen: true,
             discover: true,
             port: TCP_PORT,
@@ -228,7 +251,21 @@ pub struct Node {
     /// 与后台任务共用：界面读状态、后台改状态。
     links: Links,
     presence: Presence,
-    store: Arc<Mutex<PeerStore>>,
+    peers: Arc<dyn PeerBook>,
+    /// 心跳间隔（毫秒）。前台 10 秒、后台 25 秒，见 [`HEARTBEAT_FOREGROUND`]。
+    heartbeat_ms: Arc<AtomicU64>,
+    /// 当前网络能不能跑局域网直连（蜂窝下为 false）。
+    network_ok: Arc<AtomicBool>,
+    /// 各设备的拨号退避状态。
+    retry: Arc<Mutex<HashMap<String, RetryState>>>,
+}
+
+/// 一台设备的拨号退避状态。
+struct RetryState {
+    /// 连续失败次数，连上即归零。
+    failures: u32,
+    /// 允许下一次拨号的最早时刻。
+    next_at: Instant,
 }
 
 impl Node {
@@ -255,10 +292,8 @@ impl Node {
             .and_then(|l| l.local_port().ok())
             .unwrap_or(cfg.port);
 
-        // 配对表在这里加载：状态查询要读它，不能等后台任务起来才有。
-        // 加载失败直接报错——表里是用户的信任关系，静默降级成空表等于把所有
-        // 设备退回未配对，用户只会看到「设备都不见了」。
-        let store = Arc::new(Mutex::new(PeerStore::load(&cfg.store_path)?));
+        // 已配对设备由宿主提供：协议层只查询，不关心存哪。
+        let peers = Arc::clone(&cfg.peers);
 
         let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel();
         let (event_tx, event_rx) = std_mpsc::channel();
@@ -269,15 +304,21 @@ impl Node {
 
         let task_port = Arc::clone(&port);
         let task_presence = Arc::clone(&presence);
+        let heartbeat_ms = Arc::new(AtomicU64::new(HEARTBEAT_FOREGROUND.as_millis() as u64));
+        let network_ok = Arc::new(AtomicBool::new(true));
+        let retry: Arc<Mutex<HashMap<String, RetryState>>> = Arc::new(Mutex::new(HashMap::new()));
         let hub = Hub {
             cfg,
-            store: Arc::clone(&store),
+            peers: Arc::clone(&peers),
             links: Arc::clone(&links),
             // 各 topic 的最近一条：无连接时投递的变更没有队列，靠它在新连接建立后补发。
             // 剪贴板是单值资源，只保留最新一条即可（与协议「只关心最新值」一致）。
             cache: Arc::new(Mutex::new(Cache::default())),
             connecting: Arc::new(Mutex::new(HashSet::new())),
             events: event_tx,
+            heartbeat_ms: Arc::clone(&heartbeat_ms),
+            network_ok: Arc::clone(&network_ok),
+            retry: Arc::clone(&retry),
         };
         rt.spawn(async move {
             run(hub, listener, actual_port, cmd_rx, task_port, task_presence).await;
@@ -291,7 +332,10 @@ impl Node {
             port,
             links,
             presence,
-            store,
+            peers,
+            heartbeat_ms,
+            network_ok,
+            retry,
         })
     }
 
@@ -310,13 +354,8 @@ impl Node {
     /// 界面按秒轮询它即可，不需要自己维护状态机——事件是边沿的，
     /// 断线重连时会连发两条，按事件改灯就会闪。
     pub fn status(&self) -> NodeStatus {
-        // 先取出已配对表快照并释放锁：三把锁不能嵌套，否则与后台上锁顺序
-        // 不一致时会死锁。
-        let known: Vec<PairedPeer> = self
-            .store
-            .lock()
-            .map(|s| s.all().cloned().collect())
-            .unwrap_or_default();
+        // 设备表由宿主实现，读它不该阻塞网络任务；拿完快照再取其余状态。
+        let known: Vec<PairedPeer> = self.peers.all();
         let links = self.links.lock().ok();
         let presence = self.presence.lock().ok();
         let now = Instant::now();
@@ -353,6 +392,40 @@ impl Node {
             did: self.did.clone(),
             port: self.local_port(),
             peers,
+        }
+    }
+
+    /// 前台/后台切换：后台把心跳拉长，减少射频唤醒。
+    ///
+    /// 不能无限拉长——对端的读超时是 30 秒（写死在协议实现里），超过就断线，
+    /// 所以后台也只到 25 秒。真正省电的是「蜂窝下不跑」和「重试退避」。
+    pub fn set_background(&self, background: bool) {
+        let interval = if background {
+            HEARTBEAT_BACKGROUND
+        } else {
+            HEARTBEAT_FOREGROUND
+        };
+        self.heartbeat_ms
+            .store(interval.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// 当前网络是否值得跑局域网直连。
+    ///
+    /// 蜂窝网络下 P2P 不可能成功：拨号只会超时、广播只会空转，白白唤醒射频。
+    /// 宿主切到蜂窝时传 `false`：立刻断开已有连接、停止广播与重试；
+    /// 回到 Wi-Fi 再传 `true`，重试会从最短间隔重新开始。
+    pub fn set_network_available(&self, available: bool) {
+        self.network_ok.store(available, Ordering::Relaxed);
+        if available {
+            // 重新可用：清掉退避，别让上次的 5 分钟惩罚拖住重连。
+            if let Ok(mut retry) = self.retry.lock() {
+                retry.clear();
+            }
+            return;
+        }
+        // 立即断开，而不是等心跳超时——那要几十秒，界面会一直显示「在线」。
+        for (_, tx) in link_targets(&self.links) {
+            let _ = tx.send(Outbound::Close);
         }
     }
 
@@ -421,11 +494,14 @@ impl Drop for Node {
 #[derive(Clone)]
 struct Hub {
     cfg: NodeConfig,
-    store: Arc<Mutex<PeerStore>>,
+    peers: Arc<dyn PeerBook>,
     links: Links,
     connecting: Connecting,
     cache: Arc<Mutex<Cache>>,
     events: std_mpsc::Sender<Event>,
+    heartbeat_ms: Arc<AtomicU64>,
+    network_ok: Arc<AtomicBool>,
+    retry: Arc<Mutex<HashMap<String, RetryState>>>,
 }
 
 async fn run(
@@ -450,7 +526,11 @@ async fn run(
     if hub.cfg.discover {
         // 不监听就不广播：别人即使收到公告也连不进来，广播只会造成无效连接尝试。
         if can_accept {
-            tokio::spawn(announce_loop(Arc::clone(&hub.cfg.identity), port));
+            tokio::spawn(announce_loop(
+                Arc::clone(&hub.cfg.identity),
+                port,
+                Arc::clone(&hub.network_ok),
+            ));
         }
         tokio::spawn(discover_loop(hub.clone(), presence));
     }
@@ -461,11 +541,7 @@ async fn run(
     tokio::spawn(retry_loop(hub.clone()));
 
     // ── 启动时先按「上次地址」直连一次 ──
-    let known: Vec<PairedPeer> = hub
-        .store
-        .lock()
-        .map(|s| s.all().cloned().collect())
-        .unwrap_or_default();
+    let known: Vec<PairedPeer> = hub.peers.all();
     for peer in known {
         tokio::spawn(connect_peer(hub.clone(), peer));
     }
@@ -552,23 +628,23 @@ async fn accept_loop(identity: Arc<Identity>, hub: Hub, listener: Listener) {
         let Ok((stream, addr)) = listener.accept().await else {
             continue;
         };
+        // 网络不可用时连入站也不该继续：宿主说的是「现在别走局域网」，
+        // 只挡出站会让对端不停地连进来、握手、再被踢，双方都白耗电。
+        if !hub.network_ok.load(Ordering::Relaxed) {
+            drop(stream);
+            continue;
+        }
         // 握手期间用快照，避免与配对写入争锁；配对表只有几项，克隆成本可忽略。
         // 每次 accept 前重读一次磁盘：新配对是在设置应用（另一个进程）里写入的，
         // 常驻的输入法进程不重读就会一直认为对方未配对。
-        let snapshot = match hub.store.lock() {
-            Ok(mut s) => {
-                let _ = s.reload();
-                s.clone()
-            }
-            Err(_) => continue,
-        };
+        // 宿主实现自己保证数据新鲜（SQLite 每次查、内存实现由宿主灌入）。
         let identity = Arc::clone(&identity);
         let hub = hub.clone();
         tokio::spawn(async move {
-            match session_accept(stream, &identity, &snapshot).await {
+            match session_accept(stream, &identity, hub.peers.as_ref()).await {
                 Ok(conn) => {
                     let peer_did = conn.peer_did().to_string();
-                    remember_addr(&hub.store, &peer_did, addr);
+                    remember_addr(&hub.peers, &peer_did, addr);
                     // 入站：这条连接是对方拨过来的。
                     serve(conn, addr, hub, true).await;
                 }
@@ -608,6 +684,11 @@ async fn connect_peer(hub: Hub, peer: PairedPeer) {
 
 /// 连指定地址。成功后回写 `last_addr`，下次可直接复用。
 async fn connect_peer_at(hub: Hub, peer: PairedPeer, addr: SocketAddr) {
+    // 蜂窝网络下拨局域网地址只会超时。宿主说不可用时直接放弃，
+    // 连 SYN 都不该发出去——那是实打实的射频唤醒。
+    if !hub.network_ok.load(Ordering::Relaxed) {
+        return;
+    }
     // 已有连接就不再叠加：同一台设备两条会话只会互相顶掉，界面还会闪一下。
     // 注意只检查这一台——别的设备在线不影响本台重连。
     if hub
@@ -641,7 +722,7 @@ async fn connect_peer_at(hub: Hub, peer: PairedPeer, addr: SocketAddr) {
     };
     match session_initiate(stream, &hub.cfg.identity, &peer).await {
         Ok(conn) => {
-            remember_addr(&hub.store, &peer.did, addr);
+            remember_addr(&hub.peers, &peer.did, addr);
             // 出站：这条连接由本机拨出。
             serve(conn, addr, hub, false).await;
         }
@@ -696,6 +777,10 @@ async fn serve(mut conn: Connection<TcpStream>, addr: SocketAddr, hub: Hub, inbo
     if let Some(old) = previous {
         let _ = old.tx.send(Outbound::Close);
     }
+    // 连上了就把退避清零：下次掉线要立刻重试，而不是接着上次的 5 分钟。
+    if let Ok(mut retry) = hub.retry.lock() {
+        retry.remove(&did);
+    }
     if first_link {
         emit(
             &hub.events,
@@ -728,11 +813,15 @@ async fn serve(mut conn: Connection<TcpStream>, addr: SocketAddr, hub: Hub, inbo
     // 心跳：`Connection::recv` 自带 30 秒读超时，而协议里没人主动发帧，
     // 两端都沉默时空闲连接会被自己判死（表现为连上 30 秒后掉线再重连）。
     // 顺带把死连接检测压到秒级：对端拔网线时不会再有十几分钟的假在线。
+    //
+    // 定时器用固定小步长，真正发不发由「距上次发送过了多久」决定：
+    // 这样前后台切换只需改一个原子量，不用重建连接任务。
     let mut beat = tokio::time::interval_at(
-        tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
-        HEARTBEAT_INTERVAL,
+        tokio::time::Instant::now() + HEARTBEAT_TICK,
+        HEARTBEAT_TICK,
     );
     beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_ping = Instant::now();
 
     // select 的结果先落到 `step`，等 select 结束再操作 conn——
     // 否则两个分支会同时借用 `conn`，借用检查过不去。
@@ -772,10 +861,16 @@ async fn serve(mut conn: Connection<TcpStream>, addr: SocketAddr, hub: Hub, inbo
                 break;
             }
             Step::Beat => {
+                // 前后台切换只改这一个原子量，间隔立刻生效。
+                let want = Duration::from_millis(hub.heartbeat_ms.load(Ordering::Relaxed));
+                if last_ping.elapsed() < want {
+                    continue;
+                }
                 if let Err(e) = conn.ping().await {
                     tracing::debug!("{name} 心跳发送失败：{e}");
                     break;
                 }
+                last_ping = Instant::now();
             }
             Step::Outbound(Some(Outbound::Clipboard(p))) => {
                 if let Err(e) = conn.send_clipboard(p).await {
@@ -803,10 +898,8 @@ async fn serve(mut conn: Connection<TcpStream>, addr: SocketAddr, hub: Hub, inbo
     // 令牌（token）是每次建连唯一递增的，只有仍指向自己时才删。
     let removed = unregister(&hub.links, &did, token);
     if removed {
-        if let Ok(mut s) = hub.store.lock() {
-            // 记下最后一次确认在线的时间，重启后界面能显示「上次在线 …」。
-            let _ = s.set_last_seen(&did, now_secs());
-        }
+        // 记下最后一次确认在线的时间，重启后界面能显示「上次在线 …」。
+        let _ = hub.peers.set_last_seen(&did, now_secs());
         emit(
             &hub.events,
             Event::Peer {
@@ -829,21 +922,34 @@ enum Step {
 ///
 /// 发现循环依赖公告；公告到不了时（跨网段、AP 隔离、多网卡发错口），
 /// 没有这条重试就再也连不上——这正是「设备明明开着却一直离线」的成因。
+/// 已配对但当前没连上的设备，按退避节奏重试。
+///
+/// 发现循环依赖公告；公告到不了时（跨网段、AP 隔离、多网卡发错口），
+/// 没有这条重试就再也连不上——这正是「设备明明开着却一直离线」的成因。
+///
+/// 退避的意义在手机端：对端长期不在线时，固定 5 秒一天要拨 1.7 万次，
+/// 每次都是一次射频唤醒。5s → 15s → 30s → 60s → 300s 之后基本可以忽略。
 async fn retry_loop(hub: Hub) {
-    let mut ticker = tokio::time::interval(RETRY_INTERVAL);
+    let mut ticker = tokio::time::interval(RETRY_TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // 配对表最多每 5 秒重读一次：1 秒一次的文件读在手机上就是白唤醒。
+    // 新配对晚 5 秒被发现没有实际影响（用户还在设置页里）。
+    const RELOAD_EVERY: Duration = Duration::from_secs(5);
+    let mut peers: Vec<PairedPeer> = Vec::new();
+    let mut last_reload: Option<Instant> = None;
     loop {
         ticker.tick().await;
-        // 每轮重读磁盘：新配对在另一个进程里完成，不重读就永远不知道。
-        let known: Vec<PairedPeer> = hub
-            .store
-            .lock()
-            .map(|mut s| {
-                let _ = s.reload();
-                s.all().cloned().collect()
-            })
-            .unwrap_or_default();
-        for peer in known {
+        // 网络不可用（蜂窝）时完全不拨号，也不推进退避——
+        // 回到 Wi-Fi 后应当立刻按最短间隔重连，而不是接着罚站。
+        if !hub.network_ok.load(Ordering::Relaxed) {
+            continue;
+        }
+        let now = Instant::now();
+        if last_reload.is_none_or(|t| now.duration_since(t) >= RELOAD_EVERY) {
+            last_reload = Some(now);
+            peers = hub.peers.all();
+        }
+        for peer in &peers {
             if peer.last_addr.is_none() {
                 continue;
             }
@@ -855,19 +961,43 @@ async fn retry_loop(hub: Hub) {
             {
                 continue;
             }
-            tokio::spawn(connect_peer(hub.clone(), peer));
+            // 到期才拨：失败一次就往后推一档。
+            let due = {
+                let Ok(mut retry) = hub.retry.lock() else {
+                    continue;
+                };
+                let entry = retry.entry(peer.did.clone()).or_insert(RetryState {
+                    failures: 0,
+                    next_at: now,
+                });
+                if entry.next_at > now {
+                    false
+                } else {
+                    // 本次是第 `failures + 1` 次尝试：第一次失败后等 5 秒。
+                    let delay = retry_delay(entry.failures + 1);
+                    entry.failures = entry.failures.saturating_add(1);
+                    entry.next_at = now + delay;
+                    true
+                }
+            };
+            if due {
+                tokio::spawn(connect_peer(hub.clone(), peer.clone()));
+            }
         }
     }
 }
 
-async fn announce_loop(identity: Arc<Identity>, port: u16) {
+async fn announce_loop(identity: Arc<Identity>, port: u16, network_ok: Arc<AtomicBool>) {
     let Ok(broadcaster) = Broadcaster::bind().await else {
         return;
     };
     let ann = Announce::new(identity.did().to_hex(), port, AnnKind::Node);
     loop {
-        // 广播失败不是致命问题（可能暂时没有可用网卡），下一轮再试。
-        let _ = broadcaster.send(&ann).await;
+        // 网络不可用（蜂窝）时不广播：局域网里根本没人能收到，只是白耗电。
+        if network_ok.load(Ordering::Relaxed) {
+            // 广播失败不是致命问题（可能暂时没有可用网卡），下一轮再试。
+            let _ = broadcaster.send(&ann).await;
+        }
         tokio::time::sleep(ANNOUNCE_INTERVAL).await;
     }
 }
@@ -896,12 +1026,9 @@ async fn discover_loop(hub: Hub, presence: Presence) {
         if ann.k == AnnKind::Pair {
             continue;
         }
-        // 每轮重新读盘：新配对是在设置进程里写进表的，常驻节点不重读就会一直
-        // 认为对方未配对——表现为「配完了，但要重启键盘才连上」。
-        let Some(peer) = hub.store.lock().ok().and_then(|mut s| {
-            let _ = s.reload();
-            s.get(&ann.did).cloned()
-        }) else {
+        // 直接向宿主查：新配对写进它自己的存储后，下一次公告就能连上，
+        // 不需要「配完了但要重启键盘」。
+        let Some(peer) = hub.peers.get(&ann.did) else {
             continue;
         };
         // 公告里带的是对端真实端口（可能已顺延），不能假定为固定端口。
@@ -914,12 +1041,10 @@ async fn discover_loop(hub: Hub, presence: Presence) {
 // ─────────────────────────── 工具 ───────────────────────────
 
 /// 记录对端的可达地址，供发现失败时直连。
-fn remember_addr(store: &Arc<Mutex<PeerStore>>, did: &str, addr: std::net::SocketAddr) {
-    if let Ok(mut s) = store.lock()
-        && s.set_last_addr(did, addr.to_string()).is_ok()
-    {
-        let _ = s.save();
-    }
+fn remember_addr(peers: &Arc<dyn PeerBook>, did: &str, addr: std::net::SocketAddr) {
+    // 只更新这一台：宿主实现应当按行更新（SQLite 的 UPDATE），
+    // 别让它把整张表重写一遍，否则设置程序同时配对时还是会丢。
+    let _ = peers.set_last_addr(did, &addr.to_string());
 }
 
 fn emit(events: &std_mpsc::Sender<Event>, event: Event) {
@@ -944,11 +1069,13 @@ pub fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::MemoryPeerBook;
     use std::net::Ipv4Addr;
 
-    fn temp_store() -> (tempfile::TempDir, PathBuf) {
+    #[allow(dead_code)]
+    fn temp_store() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("peers.json");
+        let path = dir.path().join("peers.db");
         (dir, path)
     }
 
@@ -970,12 +1097,11 @@ mod tests {
 
     #[test]
     fn 无对端时投递不阻塞且能正常关闭() {
-        let (_dir, path) = temp_store();
         let identity = Arc::new(Identity::generate().unwrap());
         let node = Node::start(NodeConfig {
             listen: false,
             discover: false,
-            ..NodeConfig::new(identity, path)
+            ..NodeConfig::new(identity, Arc::new(MemoryPeerBook::new()))
         })
         .unwrap();
         assert!(!node.did().is_empty());
@@ -986,12 +1112,11 @@ mod tests {
 
     #[test]
     fn 绑定端口后对外可见() {
-        let (_dir, path) = temp_store();
         let identity = Arc::new(Identity::generate().unwrap());
         let node = Node::start(NodeConfig {
             discover: false,
             port: 0,
-            ..NodeConfig::new(identity, path)
+            ..NodeConfig::new(identity, Arc::new(MemoryPeerBook::new()))
         })
         .unwrap();
         assert_ne!(node.local_port(), 0, "实际端口必须可读");
@@ -1002,36 +1127,34 @@ mod tests {
     /// 对端连上后必须补发一次，否则表现为「键盘开了、连上了，但刚复制的内容收不到」。
     #[test]
     fn 无连接时投递的剪贴板会在连上后补发() {
-        let (_d1, p1) = temp_store();
-        let (_d2, p2) = temp_store();
         let id1 = Arc::new(Identity::generate().unwrap());
         let id2 = Arc::new(Identity::generate().unwrap());
 
-        let mut s1 = PeerStore::load(&p1).unwrap();
+        let s1: Arc<dyn PeerBook> = Arc::new(MemoryPeerBook::new());
         s1.upsert(PairedPeer::from_public(&id2.public("B"), None))
             .unwrap();
-        s1.save().unwrap();
+
 
         let a = Node::start(NodeConfig {
             discover: false,
             port: 0,
-            ..NodeConfig::new(Arc::clone(&id1), p1)
+            ..NodeConfig::new(Arc::clone(&id1), Arc::clone(&s1))
         })
         .unwrap();
         // 此刻还没有任何连接：这条必须有缓存，否则测试拿不到。
         assert!(a.set_clipboard(Profile::from_text("early", None)));
 
-        let mut s2 = PeerStore::load(&p2).unwrap();
+        let s2: Arc<dyn PeerBook> = Arc::new(MemoryPeerBook::new());
         s2.upsert(PairedPeer::from_public(&id1.public("A"), None))
             .unwrap();
-        s2.set_last_addr(&id1.did().to_hex(), format!("127.0.0.1:{}", a.local_port()))
+        s2.set_last_addr(&id1.did().to_hex(), &format!("127.0.0.1:{}", a.local_port()))
             .unwrap();
-        s2.save().unwrap();
+
 
         let b = Node::start(NodeConfig {
             discover: false,
             port: 0,
-            ..NodeConfig::new(Arc::clone(&id2), p2)
+            ..NodeConfig::new(Arc::clone(&id2), Arc::clone(&s2))
         })
         .unwrap();
 
@@ -1050,34 +1173,32 @@ mod tests {
     /// 不再动帧层与 Node 的结构。
     #[test]
     fn 两节点可互发_topic_消息() {
-        let (_d1, p1) = temp_store();
-        let (_d2, p2) = temp_store();
         let id1 = Arc::new(Identity::generate().unwrap());
         let id2 = Arc::new(Identity::generate().unwrap());
 
-        let mut s1 = PeerStore::load(&p1).unwrap();
+        let s1: Arc<dyn PeerBook> = Arc::new(MemoryPeerBook::new());
         s1.upsert(PairedPeer::from_public(&id2.public("B"), None))
             .unwrap();
-        s1.save().unwrap();
+
 
         let a = Node::start(NodeConfig {
             discover: false,
             port: 0,
-            ..NodeConfig::new(Arc::clone(&id1), p1)
+            ..NodeConfig::new(Arc::clone(&id1), Arc::clone(&s1))
         })
         .unwrap();
 
-        let mut s2 = PeerStore::load(&p2).unwrap();
+        let s2: Arc<dyn PeerBook> = Arc::new(MemoryPeerBook::new());
         s2.upsert(PairedPeer::from_public(&id1.public("A"), None))
             .unwrap();
-        s2.set_last_addr(&id1.did().to_hex(), format!("127.0.0.1:{}", a.local_port()))
+        s2.set_last_addr(&id1.did().to_hex(), &format!("127.0.0.1:{}", a.local_port()))
             .unwrap();
-        s2.save().unwrap();
+
 
         let b = Node::start(NodeConfig {
             discover: false,
             port: 0,
-            ..NodeConfig::new(Arc::clone(&id2), p2)
+            ..NodeConfig::new(Arc::clone(&id2), Arc::clone(&s2))
         })
         .unwrap();
 
@@ -1107,40 +1228,37 @@ mod tests {
 
     #[test]
     fn 两节点可完成握手并互发剪贴板() {
-        let (_d1, p1) = temp_store();
-        let (_d2, p2) = temp_store();
 
         let id1 = Arc::new(Identity::generate().unwrap());
         let id2 = Arc::new(Identity::generate().unwrap());
 
         // 模拟「配对已完成」：互相写进对方表里。
-        let mut s1 = PeerStore::load(&p1).unwrap();
+        let s1: Arc<dyn PeerBook> = Arc::new(MemoryPeerBook::new());
         s1.upsert(PairedPeer::from_public(&id2.public("B"), None))
             .unwrap();
-        s1.save().unwrap();
-        let mut s2 = PeerStore::load(&p2).unwrap();
+
+        let s2: Arc<dyn PeerBook> = Arc::new(MemoryPeerBook::new());
         // 先把 A 写进来，地址稍后补（要等 A 真的绑好端口）。
         s2.upsert(PairedPeer::from_public(&id1.public("A"), None))
             .unwrap();
-        s2.save().unwrap();
+
 
         let a = Node::start(NodeConfig {
             discover: false,
             port: 0,
-            ..NodeConfig::new(Arc::clone(&id1), p1)
+            ..NodeConfig::new(Arc::clone(&id1), Arc::clone(&s1))
         })
         .unwrap();
 
-        // A 的端口已知后，补进 B 的对端表，B 启动即会自动连过来。
-        let mut s2 = PeerStore::load(&p2).unwrap();
-        s2.set_last_addr(&id1.did().to_hex(), format!("127.0.0.1:{}", a.local_port()))
+        // A 的端口已知后，补进 B 的设备表，B 启动即会自动连过来。
+        s2.set_last_addr(&id1.did().to_hex(), &format!("127.0.0.1:{}", a.local_port()))
             .unwrap();
-        s2.save().unwrap();
+
 
         let b = Node::start(NodeConfig {
             discover: false,
             port: 0,
-            ..NodeConfig::new(Arc::clone(&id2), p2)
+            ..NodeConfig::new(Arc::clone(&id2), Arc::clone(&s2))
         })
         .unwrap();
 
@@ -1221,9 +1339,6 @@ mod tests {
     /// 「列表里永远只有一台在线」，且复制内容只会到其中一台。
     #[test]
     fn 三台设备可同时在线且剪贴板广播到全部() {
-        let (_d1, p1) = temp_store();
-        let (_d2, p2) = temp_store();
-        let (_d3, p3) = temp_store();
         let id1 = Arc::new(Identity::generate().unwrap());
         let id2 = Arc::new(Identity::generate().unwrap());
         let id3 = Arc::new(Identity::generate().unwrap());
@@ -1232,40 +1347,44 @@ mod tests {
         let did3 = id3.did().to_hex();
 
         // A 的配对表里有两台设备。
-        let mut s1 = PeerStore::load(&p1).unwrap();
+        let s1: Arc<dyn PeerBook> = Arc::new(MemoryPeerBook::new());
         s1.upsert(PairedPeer::from_public(&id2.public("B"), None))
             .unwrap();
         s1.upsert(PairedPeer::from_public(&id3.public("C"), None))
             .unwrap();
-        s1.save().unwrap();
+
 
         let a = Node::start(NodeConfig {
             discover: false,
             port: 0,
-            ..NodeConfig::new(Arc::clone(&id1), p1)
+            ..NodeConfig::new(Arc::clone(&id1), Arc::clone(&s1))
         })
         .unwrap();
         let port = a.local_port();
 
-        for (id, path, name) in [(&id2, &p2, "B"), (&id3, &p3, "C")] {
-            let mut s = PeerStore::load(path).unwrap();
-            s.upsert(PairedPeer::from_public(&id1.public("A"), None))
+        // B、C 各自只有 A，并且都已经知道 A 的地址。
+        let make_client = |peer_id: &Identity| {
+            let book: Arc<dyn PeerBook> = Arc::new(MemoryPeerBook::new());
+            book.upsert(PairedPeer::from_public(&id1.public("A"), None))
                 .unwrap();
-            s.set_last_addr(&did1, format!("127.0.0.1:{port}")).unwrap();
-            s.save().unwrap();
-            let _ = (id, name);
-        }
+            book.set_last_addr(&did1, &format!("127.0.0.1:{port}"))
+                .unwrap();
+            let _ = peer_id;
+            book
+        };
+        let s2 = make_client(&id2);
+        let s3 = make_client(&id3);
 
         let b = Node::start(NodeConfig {
             discover: false,
             port: 0,
-            ..NodeConfig::new(Arc::clone(&id2), p2)
+            ..NodeConfig::new(Arc::clone(&id2), Arc::clone(&s2))
         })
         .unwrap();
         let c = Node::start(NodeConfig {
             discover: false,
             port: 0,
-            ..NodeConfig::new(Arc::clone(&id3), p3)
+            ..NodeConfig::new(Arc::clone(&id3), Arc::clone(&s3))
         })
         .unwrap();
 
@@ -1333,20 +1452,19 @@ mod tests {
     /// 合成一个布尔量会让界面说谎：设备明明开着、只是没连上，却显示成离线。
     #[test]
     fn 状态快照区分在线_附近与离线() {
-        let (_dir, path) = temp_store();
         let id1 = Arc::new(Identity::generate().unwrap());
         let id2 = Arc::new(Identity::generate().unwrap());
         let did2 = id2.did().to_hex();
 
-        let mut s1 = PeerStore::load(&path).unwrap();
+        let s1: Arc<dyn PeerBook> = Arc::new(MemoryPeerBook::new());
         s1.upsert(PairedPeer::from_public(&id2.public("B"), None))
             .unwrap();
-        s1.save().unwrap();
+
 
         let a = Node::start(NodeConfig {
             discover: false,
             port: 0,
-            ..NodeConfig::new(Arc::clone(&id1), path)
+            ..NodeConfig::new(Arc::clone(&id1), Arc::clone(&s1))
         })
         .unwrap();
 
@@ -1415,21 +1533,22 @@ mod tests {
             let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
             l.local_addr().unwrap().port()
         };
-        let (_d1, p1) = temp_store();
         let id1 = Arc::new(Identity::generate().unwrap());
         let id2 = Arc::new(Identity::generate().unwrap());
         let did2 = id2.did().to_hex();
 
-        let mut s1 = PeerStore::load(&p1).unwrap();
-        let mut peer = PairedPeer::from_public(&id2.public("B"), None);
-        peer.last_addr = Some(format!("127.0.0.1:{port}"));
+        let s1: Arc<dyn PeerBook> = Arc::new(MemoryPeerBook::new());
+        let peer = PairedPeer::from_public(&id2.public("B"), None);
         s1.upsert(peer).unwrap();
-        s1.save().unwrap();
+        // 地址单独 UPDATE：直接把 last_addr 塞进 PairedPeer 再 upsert 也行，
+        // 但那样语义不清（upsert 说的是「信任锚」）。
+        s1.set_last_addr(&did2, &format!("127.0.0.1:{port}"))
+            .unwrap();
 
         let a = Node::start(NodeConfig {
             discover: false,
             port: 0,
-            ..NodeConfig::new(Arc::clone(&id1), p1)
+            ..NodeConfig::new(Arc::clone(&id1), Arc::clone(&s1))
         })
         .unwrap();
         // 此刻 B 还没起，首次连接必然失败。
@@ -1438,15 +1557,14 @@ mod tests {
             "B 还没启动，不该已经连上"
         );
 
-        let (_d2, p2) = temp_store();
-        let mut s2 = PeerStore::load(&p2).unwrap();
+        let s2: Arc<dyn PeerBook> = Arc::new(MemoryPeerBook::new());
         s2.upsert(PairedPeer::from_public(&id1.public("A"), None))
             .unwrap();
-        s2.save().unwrap();
+
         let b = Node::start(NodeConfig {
             discover: false,
             port,
-            ..NodeConfig::new(Arc::clone(&id2), p2)
+            ..NodeConfig::new(Arc::clone(&id2), Arc::clone(&s2))
         })
         .unwrap();
 
@@ -1488,24 +1606,22 @@ mod tests {
             l.local_addr().unwrap().port()
         };
         let (pa, pb) = (port(), port());
-        let (_da, sa) = temp_store();
-        let (_db, sb) = temp_store();
         let ida = Arc::new(Identity::generate().unwrap());
         let idb = Arc::new(Identity::generate().unwrap());
         let did_a = ida.did().to_hex();
         let did_b = idb.did().to_hex();
 
-        for (path, me, peer, peer_addr) in [
-            (&sa, &ida, &idb, format!("127.0.0.1:{pb}")),
-            (&sb, &idb, &ida, format!("127.0.0.1:{pa}")),
-        ] {
-            let mut s = PeerStore::load(path).unwrap();
-            s.upsert(PairedPeer::from_public(&peer.public("x"), None))
-                .unwrap();
-            s.set_last_addr(&peer.did().to_hex(), peer_addr).unwrap();
-            s.save().unwrap();
-            let _ = me;
-        }
+        // 两端互相知道地址，启动时必然同时拨号。
+        let sa: Arc<dyn PeerBook> = Arc::new(MemoryPeerBook::new());
+        sa.upsert(PairedPeer::from_public(&idb.public("B"), None))
+            .unwrap();
+        sa.set_last_addr(&did_b, &format!("127.0.0.1:{pb}"))
+            .unwrap();
+        let sb: Arc<dyn PeerBook> = Arc::new(MemoryPeerBook::new());
+        sb.upsert(PairedPeer::from_public(&ida.public("A"), None))
+            .unwrap();
+        sb.set_last_addr(&did_a, &format!("127.0.0.1:{pa}"))
+            .unwrap();
 
         let a = Node::start(NodeConfig {
             discover: false,
@@ -1550,34 +1666,32 @@ mod tests {
     #[test]
     #[ignore = "需 35 秒，验证心跳维持空闲连接"]
     fn 心跳维持空闲连接() {
-        let (_d1, p1) = temp_store();
-        let (_d2, p2) = temp_store();
         let id1 = Arc::new(Identity::generate().unwrap());
         let id2 = Arc::new(Identity::generate().unwrap());
         let did1 = id1.did().to_hex();
         let did2 = id2.did().to_hex();
 
-        let mut s1 = PeerStore::load(&p1).unwrap();
+        let s1: Arc<dyn PeerBook> = Arc::new(MemoryPeerBook::new());
         s1.upsert(PairedPeer::from_public(&id2.public("B"), None))
             .unwrap();
-        s1.save().unwrap();
+
         let a = Node::start(NodeConfig {
             discover: false,
             port: 0,
-            ..NodeConfig::new(Arc::clone(&id1), p1)
+            ..NodeConfig::new(Arc::clone(&id1), Arc::clone(&s1))
         })
         .unwrap();
 
-        let mut s2 = PeerStore::load(&p2).unwrap();
+        let s2: Arc<dyn PeerBook> = Arc::new(MemoryPeerBook::new());
         s2.upsert(PairedPeer::from_public(&id1.public("A"), None))
             .unwrap();
-        s2.set_last_addr(&did1, format!("127.0.0.1:{}", a.local_port()))
+        s2.set_last_addr(&did1, &format!("127.0.0.1:{}", a.local_port()))
             .unwrap();
-        s2.save().unwrap();
+
         let b = Node::start(NodeConfig {
             discover: false,
             port: 0,
-            ..NodeConfig::new(Arc::clone(&id2), p2)
+            ..NodeConfig::new(Arc::clone(&id2), Arc::clone(&s2))
         })
         .unwrap();
 
@@ -1597,5 +1711,105 @@ mod tests {
 
         a.shutdown();
         b.shutdown();
+    }
+
+    /// 退避必须逐级拉长并封顶：对端长期不在线时，固定 5 秒一天要拨 1.7 万次。
+    #[test]
+    fn 重试退避逐级拉长并封顶() {
+        assert_eq!(retry_delay(1), Duration::from_secs(5));
+        assert_eq!(retry_delay(2), Duration::from_secs(15));
+        assert_eq!(retry_delay(3), Duration::from_secs(30));
+        assert_eq!(retry_delay(4), Duration::from_secs(60));
+        assert_eq!(retry_delay(5), Duration::from_secs(300));
+        // 超过档位后封顶，不会无上限增长。
+        assert_eq!(retry_delay(50), Duration::from_secs(300));
+    }
+
+    /// 宿主说「现在别走局域网」（典型是切到蜂窝）时，节点必须真的停下来：
+    /// 断开已有连接、不再拨号、也不接受入站。
+    #[test]
+    fn 网络不可用时断开且不再重连() {
+        let id1 = Arc::new(Identity::generate().unwrap());
+        let id2 = Arc::new(Identity::generate().unwrap());
+        let did1 = id1.did().to_hex();
+        let did2 = id2.did().to_hex();
+
+        let s1: Arc<dyn PeerBook> = Arc::new(MemoryPeerBook::new());
+        s1.upsert(PairedPeer::from_public(&id2.public("B"), None))
+            .unwrap();
+
+        let a = Node::start(NodeConfig {
+            discover: false,
+            port: 0,
+            ..NodeConfig::new(Arc::clone(&id1), Arc::clone(&s1))
+        })
+        .unwrap();
+
+        let s2: Arc<dyn PeerBook> = Arc::new(MemoryPeerBook::new());
+        s2.upsert(PairedPeer::from_public(&id1.public("A"), None))
+            .unwrap();
+        s2.set_last_addr(&did1, &format!("127.0.0.1:{}", a.local_port()))
+            .unwrap();
+
+        let b = Node::start(NodeConfig {
+            discover: false,
+            port: 0,
+            ..NodeConfig::new(Arc::clone(&id2), Arc::clone(&s2))
+        })
+        .unwrap();
+
+        assert!(wait_state(
+            &a,
+            &did2,
+            PeerState::Online,
+            Duration::from_secs(10)
+        ));
+
+        // A 说「别走局域网」：立刻断开，且不再接受 B 的入站。
+        a.set_network_available(false);
+        assert!(
+            wait_state(&a, &did2, PeerState::Offline, Duration::from_secs(5)),
+            "网络不可用后应立刻断开"
+        );
+        // B 重试拨号会被 A 丢掉，A 侧必须保持离线。
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(
+            a.status().peers[0].state,
+            PeerState::Offline,
+            "网络不可用期间不该恢复连接"
+        );
+
+        // 恢复后应当自己连回来（B 的退避最多一档，A 也会重试）。
+        a.set_network_available(true);
+        assert!(
+            wait_state(&a, &did2, PeerState::Online, Duration::from_secs(30)),
+            "网络恢复后没有重连"
+        );
+
+        a.shutdown();
+        b.shutdown();
+    }
+
+    /// 前后台切换只改心跳间隔，不能把连接弄断。
+    #[test]
+    fn 后台心跳拉长且不改连接() {
+        let id = Arc::new(Identity::generate().unwrap());
+        let node = Node::start(NodeConfig {
+            discover: false,
+            port: 0,
+            ..NodeConfig::new(id, Arc::new(MemoryPeerBook::new()))
+        })
+        .unwrap();
+        node.set_background(true);
+        assert_eq!(
+            node.heartbeat_ms.load(Ordering::Relaxed),
+            HEARTBEAT_BACKGROUND.as_millis() as u64
+        );
+        node.set_background(false);
+        assert_eq!(
+            node.heartbeat_ms.load(Ordering::Relaxed),
+            HEARTBEAT_FOREGROUND.as_millis() as u64
+        );
+        node.shutdown();
     }
 }

@@ -44,11 +44,16 @@ char *xime_p2p_pair_poll(void);
 /* 取消配对。返回 1 表示确实取消了。 */
 int xime_p2p_pair_cancel(void);
 
-/* 已配对设备：-> {ok,peers:[{did,name,last_addr,paired_at}]} */
-char *xime_p2p_peers(const char *dir);
+/* 已配对设备（进程内镜像）：-> {ok,peers:[PairedPeer...]}。
+ * 存储归宿主：配对/修改后读回它，写进你自己的库。 */
+char *xime_p2p_peers(void);
 
-/* 删除已配对设备。返回 1 表示确实删掉了。 */
-int xime_p2p_forget(const char *dir, const char *did);
+/* 用宿主自己的存储覆盖进程内设备表。入参是 PairedPeer 数组的 JSON。
+ * 节点启动前、配对完成、忘记设备后都应调用一次。 */
+char *xime_p2p_set_peers(const char *peers_json);
+
+/* 删除已配对设备（只改进程内镜像，宿主自己同步删库）。返回 1 表示确实删掉了。 */
+int xime_p2p_forget(const char *did);
 
 /* 释放本库返回的字符串。 */
 void xime_p2p_free(char *s);
