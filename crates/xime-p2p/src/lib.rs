@@ -41,7 +41,7 @@ pub use code::{CODE_TTL, MAX_ATTEMPTS, PairingCode};
 pub use error::{Error, ErrorCode};
 pub use frame::{FLAG_ENCRYPTED, Frame, MAX_PAYLOAD, MsgType};
 pub use identity::{Did, Identity, PublicIdentity};
-pub use node::{Event, Node, NodeConfig, now_secs};
+pub use node::{Event, Node, NodeConfig, NodeStatus, PeerState, PeerStatus, now_secs};
 pub use pair_session::{DisplaySession, StopHandle, join, join_at, load_or_create_identity};
 pub use pairing::PairKeys;
 pub use proto::{Connection, pair_as_display, pair_as_input, session_accept, session_initiate};

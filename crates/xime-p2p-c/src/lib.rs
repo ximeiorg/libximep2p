@@ -253,18 +253,25 @@ pub extern "C" fn xime_p2p_poll(max: i32) -> *mut c_char {
     })
 }
 
-/// 节点状态：`{ok,running,did,port}`。
+/// 节点状态：`{ok,running,did,port,peers:[{did,name,state,since,last_seen,addr}]}`。
+///
+/// `state` 为 `online` / `nearby` / `offline`。宿主界面按秒轮询它即可，
+/// 不要靠 `peer` 事件自己维护状态：事件是边沿的，重连时会连发两条，灯会闪。
 #[unsafe(no_mangle)]
 pub extern "C" fn xime_p2p_status() -> *mut c_char {
     guard(|| {
         let guard = NODE.lock().map_err(|_| "状态锁不可用")?;
         match guard.as_ref() {
-            Some(node) => Ok(json!({
-                "ok": true,
-                "running": true,
-                "did": node.did(),
-                "port": node.local_port(),
-            })),
+            Some(node) => {
+                let status = node.status();
+                Ok(json!({
+                    "ok": true,
+                    "running": true,
+                    "did": status.did,
+                    "port": status.port,
+                    "peers": status.peers,
+                }))
+            }
             None => Ok(json!({ "ok": true, "running": false })),
         }
     })
@@ -456,7 +463,9 @@ pub extern "C" fn xime_p2p_pair_cancel() -> i32 {
 
 // ─────────────────────────── 已配对设备 ───────────────────────────
 
-/// 已配对设备列表：`{ok,peers:[{did,name,last_addr,paired_at}]}`。
+/// 已配对设备列表：`{ok,peers:[{did,name,last_addr,last_seen,paired_at}]}`。
+///
+/// 这里读的是磁盘，不含实时状态；要在线状态用 [`xime_p2p_status`]。
 #[unsafe(no_mangle)]
 pub extern "C" fn xime_p2p_peers(dir: *const c_char) -> *mut c_char {
     guard(|| {
@@ -469,6 +478,7 @@ pub extern "C" fn xime_p2p_peers(dir: *const c_char) -> *mut c_char {
                     "did": p.did,
                     "name": p.name,
                     "last_addr": p.last_addr,
+                    "last_seen": p.last_seen,
                     "paired_at": p.paired_at,
                 })
             })
@@ -567,7 +577,13 @@ mod tests {
 
         let started = call_json(xime_p2p_start(dir_c.as_ptr(), 1, 0, 0));
         assert_eq!(started["ok"], true, "启动失败：{started}");
-        assert_eq!(started["port"].as_u64().unwrap(), 47821);
+        // 端口被占时会顺延（`Listener::bind` 的既定行为），开发机上常驻的输入法
+        // 就占着 47821，所以不能断言等于固定端口。
+        let port = started["port"].as_u64().expect("缺少 port");
+        assert!(
+            port >= u64::from(xime_p2p::TCP_PORT),
+            "端口应不小于基准端口，实际 {port}"
+        );
         assert_eq!(xime_p2p_status().is_null(), false);
 
         // 投递文本：无连接时也算入队成功（对端连上后补发）。

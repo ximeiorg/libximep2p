@@ -32,6 +32,12 @@ pub struct PairedPeer {
     /// 最近一次成功连接的地址 `ip:port`，用于发现失败时直连。
     #[serde(default)]
     pub last_addr: Option<String>,
+    /// 最后一次确认在线的时刻（Unix 秒）。
+    ///
+    /// 界面在节点刚启动、还没连上任何设备时，靠它显示「上次在线 …」，
+    /// 而不是干巴巴一句「离线」。
+    #[serde(default)]
+    pub last_seen: Option<i64>,
     /// 配对完成时间（Unix 秒）。
     #[serde(default)]
     pub paired_at: i64,
@@ -46,6 +52,7 @@ impl PairedPeer {
             pub_ed: hex::encode(public.ed_public()),
             pub_x25519: hex::encode(public.x_public()),
             last_addr,
+            last_seen: None,
             paired_at: now_unix(),
         }
     }
@@ -171,6 +178,20 @@ impl PeerStore {
             return Ok(());
         }
         peer.last_addr = Some(addr);
+        self.save()
+    }
+
+    /// 记录最后一次确认在线的时刻。
+    ///
+    /// 只在断开时写一次，不随心跳更新——否则每次心跳都要落盘。
+    pub fn set_last_seen(&mut self, did: &str, at: i64) -> Result<(), Error> {
+        let Some(peer) = self.peers.get_mut(did) else {
+            return Err(Error::Store(format!("未找到已配对设备 {did}")));
+        };
+        if peer.last_seen.is_some_and(|prev| at <= prev) {
+            return Ok(());
+        }
+        peer.last_seen = Some(at);
         self.save()
     }
 
