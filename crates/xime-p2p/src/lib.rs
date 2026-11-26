@@ -49,6 +49,6 @@ pub use session::{NoiseHandshake, Session};
 pub use store::{MemoryPeerBook, PairedPeer, PeerBook};
 // 供宿主构造剪贴板条目，省得它们再单独依赖 xime-sync-domain。
 pub use transport::{
-    Announce, Broadcaster, Listener, PAIR_PORT, TCP_PORT, UDP_PORT, Watcher, connect,
+    Announce, Broadcaster, Listener, PAIR_PORT, PAIR_UDP_PORT, TCP_PORT, UDP_PORT, Watcher, connect,
 };
 pub use xime_sync_domain::profile::{Profile, ProfileType};

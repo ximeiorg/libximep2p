@@ -17,7 +17,7 @@ use crate::identity::{Identity, PublicIdentity};
 use crate::proto::{pair_as_display, pair_as_input};
 use crate::store::{PairedPeer, PeerBook};
 use crate::transport::{
-    AnnKind, Announce, Broadcaster, Listener, PAIR_PORT, UDP_PORT, Watcher, connect,
+    AnnKind, Announce, Broadcaster, Listener, PAIR_PORT, PAIR_UDP_PORT, UDP_PORT, Watcher, connect,
 };
 
 /// 身份文件长度：32 字节 Ed25519 种子 + 32 字节 X25519 静态私钥。
@@ -263,7 +263,9 @@ impl DisplaySession {
                 if code.is_expired() {
                     return Err(Error::CodeExpired);
                 }
-                let _ = broadcaster.send(&ann).await;
+                // 出码公告发到配对端口（新版输入端听这里），并给旧版输入端
+                // 在 UDP_PORT 上留一份——否则「一端升级」就配不了对。
+                let _ = broadcaster.send_pair(&ann).await;
 
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
@@ -305,17 +307,14 @@ pub fn join(
 
     let rt = one_shot_runtime()?;
     rt.block_on(async move {
-        let watcher = Watcher::bind()
-            .await
-            .map_err(|e| {
-                // 最常见的成因是同一台机器上还有别的实例占着公告端口（输入法常驻
-                // 节点 + 设置程序都在收公告）。共享端口要靠两端都开 SO_REUSEPORT，
-                // 旧版没开，所以升级过渡期会在这里失败——把话说清楚，别让用户去
-                // 查防火墙。
-                Error::Internal(format!(
-                    "发现端口 {UDP_PORT} 不可用（{e}）。                     多半是另一个曦码实例正占用它：确认输入法与设置都是新版本后重启输入法再试"
-                ))
-            })?;
+        // 配对走自己的发现端口：输入法的常驻节点一直占着 UDP_PORT，
+        // 两者不该互相争（见 `PAIR_UDP_PORT` 的说明）。
+        let watcher = Watcher::bind_on(PAIR_UDP_PORT).await.map_err(|e| {
+            Error::Internal(format!("配对发现端口 {PAIR_UDP_PORT} 不可用（{e}）"))
+        })?;
+        // 旧版出码端只会往 UDP_PORT 广播：绑得到就多听一路，绑不到（比如新版
+        // 输入法正占着它）也不影响与新版配对。
+        let legacy_watcher = Watcher::bind_on(UDP_PORT).await.ok();
         let deadline = Instant::now() + timeout;
         // 公告是全频道共享的：同一网段里常驻的同步节点也在广播，它们同样会把
         // 自己的同步端口报上来。所以「连上一台设备」不等于「连上了出码端」，
@@ -335,7 +334,9 @@ pub fn join(
                     "未发现在线设备".into()
                 }));
             }
-            let Ok(Some((ann, from))) = watcher.recv(left.min(Duration::from_secs(1))).await else {
+            let slice = left.min(Duration::from_secs(1));
+            let Ok(Some((ann, from))) = recv_any(&watcher, legacy_watcher.as_ref(), slice).await
+            else {
                 continue;
             };
             // 新版对端会声明角色，常驻同步节点直接跳过，省掉一次必然失败的连接。
@@ -374,6 +375,23 @@ pub fn join(
             }
         }
     })
+}
+
+/// 从主通道（配对端口）和兼容通道（旧版同步端口）里取一条公告。
+///
+/// 两个 watcher 并行等，谁先到用谁；没有兼容通道时只等主通道。
+async fn recv_any(
+    primary: &Watcher,
+    legacy: Option<&Watcher>,
+    timeout: Duration,
+) -> Result<Option<(Announce, std::net::SocketAddr)>, Error> {
+    let Some(legacy) = legacy else {
+        return primary.recv(timeout).await;
+    };
+    tokio::select! {
+        got = primary.recv(timeout) => got,
+        got = legacy.recv(timeout) => got,
+    }
 }
 
 /// 同一台设备两次尝试之间的最小间隔（公告周期是 1 秒）。
@@ -614,6 +632,34 @@ mod tests {
         assert_eq!(b.len(), 1);
         assert!(a.iter().any(|p| p.did == id_b.did().to_hex()));
         assert!(b.iter().any(|p| p.did == id_a.did().to_hex()));
+    }
+
+    /// 输入法节点占着同步端口（47822）时，配对必须照样能开始。
+    ///
+    /// 这正是用户报的「设备互联时提示发现端口 47822 不可用」：以前配对和节点
+    /// 抢同一个 UDP 端口，macOS 上 `SO_REUSEADDR` 不够，第二个 bind 直接失败。
+    /// 现在配对走 `PAIR_UDP_PORT`，与节点互不相干。
+    #[test]
+    fn 节点占着同步端口时配对仍能开始() {
+        // 模拟常驻节点把 47822 占了。开发机上可能真有进程在占（旧版输入法），
+        // 那种情况绑不上也无所谓——本测试要的是「配对不受它影响」。
+        let held = crate::transport::bind_for_test(UDP_PORT);
+        let _keep = held;
+
+        let id = Arc::new(Identity::generate().unwrap());
+        let book: Arc<dyn PeerBook> = Arc::new(MemoryPeerBook::new());
+        let outcome = join(
+            Arc::clone(&id),
+            book,
+            "123456",
+            "Phone",
+            Duration::from_secs(1),
+        );
+        let err = outcome.expect_err("没有人出码，理应超时");
+        assert!(
+            !err.to_string().contains("不可用"),
+            "配对仍被同步端口挡住了：{err}"
+        );
     }
 
     /// 码不对时必须失败，且不能把对端写进配对表。

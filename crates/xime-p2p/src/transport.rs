@@ -23,6 +23,16 @@ pub const UDP_PORT: u16 = 47822;
 /// 混在同一端口上就得在 accept 处按首帧类型分流，而两条流程对「首帧」的
 /// 期待不同（Noise vs HELLO），分流代码容易出错且难测。分开后互不影响。
 pub const PAIR_PORT: u16 = 47823;
+/// **配对发现**专用端口。
+///
+/// 节点（同步用）与配对（输入码时找人）虽然都在发公告，但两者是两条独立的
+/// 发现通道：节点常驻，配对是一次性的。挤在 [`UDP_PORT`] 上的后果是输入法
+/// 节点占着端口、设置程序的 `join()` 绑不上。
+///
+/// 拆开之后两端各用各的，也不再依赖 `SO_REUSEPORT`（Windows 没有它）。
+/// 兼容做法在广播侧：出码端会**同时**往 [`UDP_PORT`] 发一份，让旧版输入端
+/// 仍然能发现它；输入端则优先听本端口，绑得到 [`UDP_PORT`] 时再多听一路。
+pub const PAIR_UDP_PORT: u16 = 47824;
 /// 端口被占用时顺延的最大次数。
 const PORT_PROBE_LIMIT: u16 = 16;
 /// 公告的固定标识，用于过滤同端口上的无关流量。
@@ -204,6 +214,20 @@ impl Broadcaster {
         Ok(())
     }
 
+    /// 配对公告：同时发到配对发现端口和通用的发现端口。
+    ///
+    /// 后者是给旧版输入端的——它们只监听 47822。发两份的成本是每个公告周期
+    /// 一个额外的 UDP 包，配对只持续几十秒，可以忽略。
+    pub async fn send_pair(&self, ann: &Announce) -> Result<(), Error> {
+        let bytes = ann.encode()?;
+        let pair_target = SocketAddrV4::new(Ipv4Addr::BROADCAST, PAIR_UDP_PORT);
+        self.sock.send_to(&bytes, pair_target).await?;
+        // 旧版兼容：失败不影响新版发现，静默忽略。
+        let legacy_target = SocketAddrV4::new(Ipv4Addr::BROADCAST, UDP_PORT);
+        let _ = self.sock.send_to(&bytes, legacy_target).await;
+        Ok(())
+    }
+
     /// 单播回应：收到别人的公告后，把自身公告回给对方（§5.2）。
     pub async fn reply(&self, ann: &Announce, to: SocketAddr) -> Result<(), Error> {
         let bytes = ann.encode()?;
@@ -229,7 +253,12 @@ impl Watcher {
     /// 兼容性：窗口内只有一端设置了 `SO_REUSEADDR` 时仍然绑不上，因此
     /// 升级后需要两端都重启（设置程序与 daemon 都来自同一份库）。
     pub async fn bind() -> Result<Self, Error> {
-        let sock = bind_reuse(UDP_PORT)?;
+        Self::bind_on(UDP_PORT).await
+    }
+
+    /// 绑定指定端口。配对流程用 [`PAIR_UDP_PORT`] 走自己的通道。
+    pub async fn bind_on(port: u16) -> Result<Self, Error> {
+        let sock = bind_reuse(port)?;
         Ok(Self { sock })
     }
 
@@ -285,6 +314,12 @@ fn bind_reuse(port: u16) -> Result<UdpSocket, Error> {
     socket.set_nonblocking(true)?;
     let std_sock: std::net::UdpSocket = socket.into();
     Ok(UdpSocket::from_std(std_sock)?)
+}
+
+/// 测试用：直接拿到一个绑定好的 socket，用来「占住端口」模拟另一进程。
+#[cfg(test)]
+pub(crate) fn bind_for_test(port: u16) -> Result<UdpSocket, Error> {
+    bind_reuse(port)
 }
 
 #[cfg(test)]
