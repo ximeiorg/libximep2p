@@ -307,7 +307,15 @@ pub fn join(
     rt.block_on(async move {
         let watcher = Watcher::bind()
             .await
-            .map_err(|e| Error::Internal(format!("发现端口 {UDP_PORT} 不可用：{e}")))?;
+            .map_err(|e| {
+                // 最常见的成因是同一台机器上还有别的实例占着公告端口（输入法常驻
+                // 节点 + 设置程序都在收公告）。共享端口要靠两端都开 SO_REUSEPORT，
+                // 旧版没开，所以升级过渡期会在这里失败——把话说清楚，别让用户去
+                // 查防火墙。
+                Error::Internal(format!(
+                    "发现端口 {UDP_PORT} 不可用（{e}）。                     多半是另一个曦码实例正占用它：确认输入法与设置都是新版本后重启输入法再试"
+                ))
+            })?;
         let deadline = Instant::now() + timeout;
         // 公告是全频道共享的：同一网段里常驻的同步节点也在广播，它们同样会把
         // 自己的同步端口报上来。所以「连上一台设备」不等于「连上了出码端」，

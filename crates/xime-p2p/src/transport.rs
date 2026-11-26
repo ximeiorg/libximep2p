@@ -257,14 +257,29 @@ impl Watcher {
     }
 }
 
-/// 用 `SO_REUSEADDR` 绑定 UDP 端口，再转成 tokio socket。
+/// 用共享方式绑定 UDP 端口，再转成 tokio socket。
+///
+/// **必须同时开 `SO_REUSEADDR` 和 `SO_REUSEPORT`**：
+///
+/// - Linux 上 `SO_REUSEADDR` 就够让多个 socket 共用 UDP 端口；
+/// - **macOS / BSD 上不够**——`SO_REUSEADDR` 只解决 TIME_WAIT，第二个 bind
+///   仍然报 `EADDRINUSE`。桌面端「输入法常驻节点占着 47822，设置程序再去
+///   配对」正是这种情况，表现为「设备互联时提示发现端口不可用」。
+///
+/// 广播包会投递给共享组里的所有 socket（单播只会给其中一个），而这一层只用
+/// 广播做发现，所以两端都能收到。
 ///
 /// Windows 的 `SO_REUSEADDR` 语义是「允许抢占」，会带来安全问题，只在
 /// Unix 打开；那边的多实例冲突留给平台适配层处理。
 fn bind_reuse(port: u16) -> Result<UdpSocket, Error> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     #[cfg(unix)]
-    socket.set_reuse_address(true)?;
+    {
+        socket.set_reuse_address(true)?;
+        // 个别内核/沙箱不支持，失败了也不该让整个发现不可用：
+        // 没有冲突时 bind 仍会成功，有冲突时才需要它。
+        let _ = socket.set_reuse_port(true);
+    }
     socket.set_broadcast(true)?;
     socket.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())?;
     socket.set_nonblocking(true)?;
@@ -331,6 +346,50 @@ mod tests {
         let mut bytes = serde_json::to_vec(&ann).unwrap();
         bytes.resize(MAX_ANNOUNCE_BYTES + 1, b' ');
         assert!(Announce::decode(&bytes).is_none());
+    }
+
+    /// 输入法节点和设置程序会同时收公告（同一台机器、两个进程）。
+    /// macOS 上只有 `SO_REUSEADDR` 是不够的，第二次 bind 会报 EADDRINUSE。
+    #[tokio::test]
+    async fn 公告端口可被多个实例共用() {
+        // 不占用真实的 47822：开发机上可能正跑着旧版输入法（旧版没开
+        // SO_REUSEPORT），那会让第一条 bind 就失败，测的就不是这件事了。
+        let port = 47_000 + (std::process::id() % 500) as u16;
+        let first = bind_reuse(port);
+        assert!(first.is_ok(), "第一个实例绑定失败：{:?}", first.err());
+        let second = bind_reuse(port);
+        assert!(
+            second.is_ok(),
+            "第二个实例绑不上，多实例共用端口失效：{:?}",
+            second.err()
+        );
+    }
+
+    /// 共用端口时广播必须两端都收到（单播只会给其中一个，这里不依赖单播）。
+    #[tokio::test]
+    #[ignore = "需要可用网卡；本机验证用"]
+    async fn 共用端口时广播两端都能收到() {
+        let port = 47_500 + (std::process::id() % 400) as u16;
+        let a = bind_reuse(port).unwrap();
+        let b = bind_reuse(port).unwrap();
+        let tx = Broadcaster::bind().await.unwrap();
+        let ann = Announce::new("0".repeat(32), TCP_PORT, AnnKind::Node);
+        let bytes = ann.encode().unwrap();
+        // 直接发给这个端口：广播地址在部分环境下不可用，这里验证的是
+        // 「共用端口的 socket 都能收到」，不是广播本身。
+        tx.sock
+            .send_to(&bytes, SocketAddr::from((Ipv4Addr::BROADCAST, port)))
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; MAX_ANNOUNCE_BYTES];
+        for (name, sock) in [("A", &a), ("B", &b)] {
+            let got = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf)).await;
+            assert!(
+                matches!(got, Ok(Ok(_))),
+                "{name} 没收到广播——共用端口后广播没有投递给所有 socket"
+            );
+        }
     }
 
     #[tokio::test]
